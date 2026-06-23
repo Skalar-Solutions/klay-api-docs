@@ -1435,11 +1435,14 @@ paths:
       description: >
         Aggregate dari consumption_log per ingredient untuk periode.
         Foundation buat owner restock decision dan AI insight downstream.
+      x-klay-flag:
+        kind: not-implemented
+        note: "Returns empty entries[]; consumption_log not implemented (handler_report.go). ingredient query param is ignored."
       security: [{ BearerAuth: [] }]
       parameters:
         - { name: start_date, in: query, required: true, schema: { type: string, format: date } }
         - { name: end_date, in: query, required: true, schema: { type: string, format: date } }
-        - { name: ingredient, in: query, schema: { type: string }, description: Filter per ingredient name }
+        - { name: ingredient, in: query, schema: { type: string }, description: Filter per ingredient name (diabaikan server) }
       responses:
         '200':
           description: Laporan consumption
@@ -1539,6 +1542,9 @@ paths:
     post:
       tags: [Admin]
       summary: Admin Skalar login
+      x-klay-flag:
+        kind: not-implemented
+        note: "Route absent from admin/routes.go; admin uses X-Admin-Key header, no JWT login flow."
       requestBody:
         required: true
         content:
@@ -1577,6 +1583,9 @@ paths:
     post:
       tags: [Admin]
       summary: Refresh admin access token
+      x-klay-flag:
+        kind: not-implemented
+        note: "Route absent from admin/routes.go; admin uses X-Admin-Key header, no JWT login flow."
       responses:
         '200':
           description: Token baru
@@ -1597,6 +1606,9 @@ paths:
     post:
       tags: [Admin]
       summary: Admin logout
+      x-klay-flag:
+        kind: not-implemented
+        note: "Route absent from admin/routes.go; admin uses X-Admin-Key header, no JWT login flow."
       security: [{ BearerAuth: [] }]
       responses:
         '200':
@@ -1610,6 +1622,9 @@ paths:
     get:
       tags: [Admin]
       summary: Profil admin yang sedang login
+      x-klay-flag:
+        kind: not-implemented
+        note: "Route absent from admin/routes.go; admin uses X-Admin-Key header, no JWT login flow."
       security: [{ BearerAuth: [] }]
       responses:
         '200':
@@ -1629,31 +1644,24 @@ paths:
   /admin/owners:
     get:
       tags: [Admin]
-      summary: List semua business (cross-merchant)
-      description: Admin view. Mendukung filter status, plan, pagination.
+      summary: List semua owners (cross-merchant)
+      description: >
+        Admin view. handler.ListOwners — hanya menerima page dan limit.
+        Filter status/plan/q tidak diproses server (admin/handler.go).
       security: [{ AdminKeyAuth: [] }]
       parameters:
-        - { name: status, in: query, schema: { $ref: '#/components/schemas/BusinessStatus' } }
-        - { name: plan, in: query, schema: { $ref: '#/components/schemas/PlanEnum' } }
-        - { name: q, in: query, schema: { type: string }, description: Search nama business atau owner }
-        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: page, in: query, schema: { type: integer, default: 1, minimum: 1 } }
         - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 100 } }
       responses:
         '200':
-          description: List business
+          description: List owners berpaginasi
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   success: { type: boolean }
-                  data:
-                    type: object
-                    properties:
-                      owners:
-                        type: array
-                        items: { $ref: '#/components/schemas/BusinessAdminView' }
-                      pagination: { $ref: '#/components/schemas/Pagination' }
+                  data: { $ref: '#/components/schemas/OwnerListResult' }
                   error: { type: string, nullable: true }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1662,42 +1670,24 @@ paths:
       tags: [Admin]
       summary: Onboard merchant baru
       description: >
-        Create Business + User owner sekaligus dalam 1 endpoint.
-        Admin set initial plan, features, max_operators, dan password awal owner.
+        Create Business + User owner sekaligus. Body matches admin/model.go
+        CreateBusinessRequest. business_id digenerate server.
       security: [{ AdminKeyAuth: [] }]
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [business_name, location, category, owner_name, owner_email, owner_password, plan]
-              properties:
-                business_name: { type: string }
-                location: { type: string }
-                category: { type: string }
-                owner_name: { type: string }
-                owner_email: { type: string, format: email }
-                owner_password: { type: string, format: password }
-                owner_phone: { type: string, nullable: true }
-                plan: { $ref: '#/components/schemas/PlanEnum' }
-                features:
-                  type: array
-                  items: { type: string }
-                  description: Feature flags untuk business ini
-                max_operators: { type: integer, default: 3 }
-                qris_static_payload: { type: string, nullable: true }
-                onboard_notes: { type: string, nullable: true, description: Catatan deal khusus untuk audit }
+            schema: { $ref: '#/components/schemas/CreateBusinessRequest' }
       responses:
         '201':
-          description: Business + owner berhasil di-onboard
+          description: Owner berhasil di-onboard
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   success: { type: boolean }
-                  data: { $ref: '#/components/schemas/BusinessAdminView' }
+                  data: { $ref: '#/components/schemas/OwnerDetail' }
                   error: { type: string, nullable: true }
         '400':
           description: Input tidak valid
@@ -1718,18 +1708,18 @@ paths:
 
     get:
       tags: [Admin]
-      summary: Detail business
+      summary: Detail owner
       security: [{ AdminKeyAuth: [] }]
       responses:
         '200':
-          description: Detail
+          description: Detail owner
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   success: { type: boolean }
-                  data: { $ref: '#/components/schemas/BusinessAdminView' }
+                  data: { $ref: '#/components/schemas/OwnerDetail' }
                   error: { type: string, nullable: true }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1737,45 +1727,104 @@ paths:
 
     patch:
       tags: [Admin]
-      summary: Update business (admin-controlled fields)
+      summary: Update business info owner (admin-controlled fields)
       description: >
-        Admin update plan, features, max_operators, status, qris_payload, dll.
-        Saat status berubah, timestamp event auto-stamp:
-          - status ACTIVE pertama kali = onboarded_at di-set
-          - status SUSPENDED = suspended_at di-stamp
-          - status CHURNED = churned_at di-stamp
+        Matches admin/model.go UpdateBusinessRequest. Field yang tidak dikirim tidak berubah.
+        merchant_status enum: PENDING | REGISTERED | ACTIVE | SUSPENDED.
       security: [{ AdminKeyAuth: [] }]
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              properties:
-                name: { type: string }
-                location: { type: string }
-                category: { type: string }
-                plan: { $ref: '#/components/schemas/PlanEnum' }
-                features:
-                  type: array
-                  items: { type: string }
-                max_operators: { type: integer }
-                status: { $ref: '#/components/schemas/BusinessStatus' }
-                qris_static_payload: { type: string }
-                onboard_notes: { type: string }
+            schema: { $ref: '#/components/schemas/UpdateBusinessRequest' }
       responses:
         '200':
-          description: Business ter-update
+          description: Owner ter-update
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   success: { type: boolean }
-                  data: { $ref: '#/components/schemas/BusinessAdminView' }
+                  data: { $ref: '#/components/schemas/OwnerDetail' }
                   error: { type: string, nullable: true }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/owners/{owner_id}/status:
+    patch:
+      tags: [Admin]
+      summary: Toggle aktif/suspend owner
+      description: >
+        handler.SetOwnerStatus — boolean toggle. enabled=true mengaktifkan,
+        enabled=false mensuspend. Returns HTTP 200 { success: true } via response.NoContent().
+      security: [{ AdminKeyAuth: [] }]
+      x-klay-flag:
+        kind: suspected-bug
+        note: "Status is a boolean toggle (enabled/suspended). Prior contract implied ACTIVE/SUSPENDED/CHURNED enum on PATCH /admin/owners/{id}; actual code uses a separate boolean endpoint."
+      parameters:
+        - { name: owner_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+                  description: "true = aktifkan, false = suspend"
+      responses:
+        '200':
+          description: Status ter-toggle. response.NoContent() returns HTTP 200 { success:true }.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/owners/{owner_id}/credential:
+    post:
+      tags: [Admin]
+      summary: Set credential login owner (email dan/atau password)
+      description: >
+        handler.SetOwnerCredential. email opsional (jika dikirim harus valid email).
+        password wajib, min 6 karakter. Returns HTTP 200 { success:true } via response.NoContent().
+      security: [{ AdminKeyAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Route present in admin/routes.go but absent from prior contract."
+      parameters:
+        - { name: owner_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  nullable: true
+                  description: Opsional. Jika dikirim harus valid email format.
+                password:
+                  type: string
+                  format: password
+                  minLength: 6
+                  description: Wajib, min 6 karakter.
+      responses:
+        '200':
+          description: Credential diperbarui. response.NoContent() returns HTTP 200 { success:true }.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   # ---- Admin: Product management (CRUD penuh per business) ----
@@ -1787,6 +1836,9 @@ paths:
     get:
       tags: [Admin]
       summary: List produk milik business
+      description: >
+        handler.ListOwnerProducts. Response membungkus products di dalam object
+        { products: [...] } (bukan array langsung).
       security: [{ AdminKeyAuth: [] }]
       responses:
         '200':
@@ -1798,8 +1850,11 @@ paths:
                 properties:
                   success: { type: boolean }
                   data:
-                    type: array
-                    items: { $ref: '#/components/schemas/Product' }
+                    type: object
+                    properties:
+                      products:
+                        type: array
+                        items: { $ref: '#/components/schemas/AdminProduct' }
                   error: { type: string, nullable: true }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1807,14 +1862,16 @@ paths:
 
     post:
       tags: [Admin]
-      summary: Tambah produk untuk business (admin only)
-      description: Owner tidak punya endpoint ini. Owner request via chat ke tim Skalar.
+      summary: Tambah produk untuk business
+      description: >
+        handler.CreateProduct. Body matches admin/model.go AdminCreateProductRequest.
+        business_id diambil dari path param, bukan body.
       security: [{ AdminKeyAuth: [] }]
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/ProductInput' }
+            schema: { $ref: '#/components/schemas/AdminCreateProductRequest' }
       responses:
         '201':
           description: Produk dibuat
@@ -1824,7 +1881,7 @@ paths:
                 type: object
                 properties:
                   success: { type: boolean }
-                  data: { $ref: '#/components/schemas/Product' }
+                  data: { $ref: '#/components/schemas/AdminProduct' }
                   error: { type: string, nullable: true }
         '400':
           description: Input tidak valid
@@ -1836,17 +1893,40 @@ paths:
 
   /admin/products/{product_id}:
     parameters:
-      - { name: product_id, in: path, required: true, schema: { type: string } }
+      - { name: product_id, in: path, required: true, schema: { type: string, format: uuid } }
+
+    get:
+      tags: [Admin]
+      summary: Detail produk (termasuk recipe)
+      description: handler.GetProduct. Returns AdminProductDetail yang menyertakan recipe array.
+      security: [{ AdminKeyAuth: [] }]
+      responses:
+        '200':
+          description: Detail produk dengan recipe
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/AdminProductDetail' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
     patch:
       tags: [Admin]
-      summary: Update produk (full edit termasuk recipe)
+      summary: Update produk (partial)
+      description: >
+        handler.UpdateProduct. Body matches admin/model.go AdminUpdateProductRequest.
+        Semua field optional (pointer) — field tidak dikirim tidak berubah.
       security: [{ AdminKeyAuth: [] }]
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/ProductInput' }
+            schema: { $ref: '#/components/schemas/AdminUpdateProductRequest' }
       responses:
         '200':
           description: Produk ter-update
@@ -1856,7 +1936,7 @@ paths:
                 type: object
                 properties:
                   success: { type: boolean }
-                  data: { $ref: '#/components/schemas/Product' }
+                  data: { $ref: '#/components/schemas/AdminProduct' }
                   error: { type: string, nullable: true }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1865,7 +1945,9 @@ paths:
     delete:
       tags: [Admin]
       summary: Hapus produk
-      description: Soft delete kalau produk sudah ada di transaksi historis.
+      description: >
+        handler.DeleteProduct. Soft delete kalau produk sudah ada di transaksi historis.
+        Returns HTTP 200 { success:true } via response.NoContent() (BUKAN 204).
       security: [{ AdminKeyAuth: [] }]
       responses:
         '200':
@@ -1877,6 +1959,38 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /admin/products/{product_id}/recipe:
+    put:
+      tags: [Admin]
+      summary: Replace recipe produk
+      description: >
+        handler.UpdateProductRecipe. Mengganti seluruh recipe array (bukan merge).
+        Returns HTTP 200 { success:true } via response.NoContent() (BUKAN 204).
+      security: [{ AdminKeyAuth: [] }]
+      parameters:
+        - { name: product_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recipe]
+              properties:
+                recipe:
+                  type: array
+                  items: { $ref: '#/components/schemas/Ingredient' }
+                  description: Array ingredient baru. Mengganti seluruh recipe yang ada.
+      responses:
+        '200':
+          description: Recipe ter-update. response.NoContent() returns HTTP 200 { success:true }.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   # ---- Admin: Operator removal (on request) ----
 
   /admin/owners/{owner_id}/operators/{operator_id}:
@@ -1884,25 +1998,16 @@ paths:
       tags: [Admin]
       summary: Hapus operator atas permintaan merchant
       description: >
-        Admin hanya bisa REMOVE operator on request (misal operator resign,
-        owner gak bisa akses dashboard sementara). Tidak bisa CREATE atau EDIT
-        operator. Itu wewenang owner.
+        handler.DeleteOperator. Admin hanya bisa REMOVE operator on request.
+        Tidak ada request body — handler tidak membaca body (admin/handler.go).
+        Returns HTTP 200 { success:true } via response.NoContent() (BUKAN 204).
       security: [{ AdminKeyAuth: [] }]
       parameters:
         - { name: owner_id, in: path, required: true, schema: { type: string, format: uuid } }
         - { name: operator_id, in: path, required: true, schema: { type: string, format: uuid } }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [reason]
-              properties:
-                reason: { type: string, description: Wajib diisi untuk audit }
       responses:
         '200':
-          description: Operator dihapus
+          description: Operator dihapus. response.NoContent() returns HTTP 200 { success:true }.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SimpleSuccess' }
@@ -1910,37 +2015,33 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
-  # ---- Admin: Transaction cross-merchant view + override void ----
+  # ---- Admin: Transaction cross-merchant view + void ----
 
   /admin/transactions:
     get:
       tags: [Admin]
       summary: List transaksi cross-merchant
-      description: Read-only. Filter business, status, periode.
+      description: >
+        handler.ListTransactions. Filter yang diproses: status (string), business_id (uuid),
+        page (default 1), limit (default 20, max 100).
+        start_date/end_date TIDAK diproses oleh handler — admin/handler.go
+        mengisi AdminListTransactionsFilter tanpa date range.
       security: [{ AdminKeyAuth: [] }]
       parameters:
-        - { name: business_id, in: query, schema: { type: string, format: uuid } }
-        - { name: status, in: query, schema: { $ref: '#/components/schemas/TransactionStatus' } }
-        - { name: start_date, in: query, schema: { type: string, format: date } }
-        - { name: end_date, in: query, schema: { type: string, format: date } }
-        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: status, in: query, schema: { type: string }, description: "Filter status transaksi (string bebas, tidak divalidasi enum di handler)." }
+        - { name: business_id, in: query, schema: { type: string, format: uuid }, description: Filter per business. }
+        - { name: page, in: query, schema: { type: integer, default: 1, minimum: 1 } }
         - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 100 } }
       responses:
         '200':
-          description: List transaksi cross-merchant
+          description: List transaksi cross-merchant berpaginasi
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   success: { type: boolean }
-                  data:
-                    type: object
-                    properties:
-                      transactions:
-                        type: array
-                        items: { $ref: '#/components/schemas/Transaction' }
-                      pagination: { $ref: '#/components/schemas/Pagination' }
+                  data: { $ref: '#/components/schemas/AdminListTransactionsResult' }
                   error: { type: string, nullable: true }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1948,34 +2049,28 @@ paths:
   /admin/transactions/{transaction_id}/void:
     post:
       tags: [Admin]
-      summary: Force void transaksi (admin override)
-      description: Admin bisa void status apapun cross-merchant. Audit wajib.
+      summary: Void transaksi (admin)
+      description: >
+        handler.VoidTransaction. Tidak ada request body — handler tidak membaca body.
+        Returns HTTP 200 { success:true } via response.NoContent() (BUKAN 204).
+        409 dikembalikan jika transaksi bukan status PENDING/CONFIRMED (tidak bisa di-void).
       security: [{ AdminKeyAuth: [] }]
       parameters:
-        - { name: transaction_id, in: path, required: true, schema: { type: string } }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [void_reason]
-              properties:
-                void_reason: { type: string }
+        - { name: transaction_id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
         '200':
-          description: Transaksi VOIDED
+          description: Transaksi di-void. response.NoContent() returns HTTP 200 { success:true }.
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  success: { type: boolean }
-                  data: { $ref: '#/components/schemas/TransactionDetail' }
-                  error: { type: string, nullable: true }
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Transaksi tidak bisa di-void (sudah VOIDED atau status tidak valid)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
 # ============================================================
 # COMPONENTS
@@ -2207,7 +2302,9 @@ components:
 
     ProductInput:
       type: object
-      description: Request body untuk admin create/update produk.
+      description: >
+        Legacy schema (sebelum reconciliation). Dipertahankan untuk referensi.
+        Gunakan AdminCreateProductRequest / AdminUpdateProductRequest untuk admin endpoints.
       required: [name, price]
       properties:
         name: { type: string }
@@ -2218,6 +2315,173 @@ components:
           type: array
           items: { $ref: '#/components/schemas/RecipeIngredient' }
         is_available: { type: boolean, default: true }
+
+    # ---- Admin Owner schemas ----
+
+    CreateBusinessRequest:
+      type: object
+      description: Body POST /admin/owners. Matches admin/model.go CreateBusinessRequest.
+      required: [email, password, full_name, business_name]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password, minLength: 6 }
+        full_name: { type: string, minLength: 1, maxLength: 255 }
+        business_name: { type: string, minLength: 1, maxLength: 255 }
+        phone: { type: string, nullable: true, maxLength: 32 }
+        address: { type: string, nullable: true }
+        city: { type: string, nullable: true, maxLength: 100 }
+        country: { type: string, nullable: true, maxLength: 100 }
+
+    UpdateBusinessRequest:
+      type: object
+      description: Body PATCH /admin/owners/{owner_id}. Matches admin/model.go UpdateBusinessRequest. Semua field optional.
+      properties:
+        business_name: { type: string, nullable: true, minLength: 1, maxLength: 255 }
+        phone: { type: string, nullable: true, maxLength: 32 }
+        address: { type: string, nullable: true }
+        city: { type: string, nullable: true, maxLength: 100 }
+        country: { type: string, nullable: true, maxLength: 100 }
+        merchant_status:
+          type: string
+          nullable: true
+          enum: [PENDING, REGISTERED, ACTIVE, SUSPENDED]
+          description: Status merchant lifecycle.
+
+    OwnerSummary:
+      type: object
+      description: Satu baris di list owners. Matches admin/model.go OwnerSummary.
+      properties:
+        business_id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        klay_id: { type: string, description: "Identifier merchant (KL-...)" }
+        email: { type: string, format: email }
+        full_name: { type: string }
+        business_name: { type: string }
+        merchant_status: { type: string }
+        is_active: { type: boolean }
+        is_suspended: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    OwnerDetail:
+      type: object
+      description: Detail owner termasuk field kontak. Matches admin/model.go OwnerDetail.
+      properties:
+        business_id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        klay_id: { type: string }
+        email: { type: string, format: email }
+        full_name: { type: string }
+        business_name: { type: string }
+        phone: { type: string, nullable: true }
+        address: { type: string, nullable: true }
+        city: { type: string, nullable: true }
+        country: { type: string, nullable: true }
+        qris_string: { type: string, nullable: true }
+        merchant_status: { type: string }
+        is_active: { type: boolean }
+        is_suspended: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    OwnerListResult:
+      type: object
+      description: Response GET /admin/owners. Matches admin/model.go OwnerListResult.
+      properties:
+        owners:
+          type: array
+          items: { $ref: '#/components/schemas/OwnerSummary' }
+        total: { type: integer }
+        page: { type: integer }
+        limit: { type: integer }
+
+    # ---- Admin Product schemas ----
+
+    Ingredient:
+      type: object
+      description: Satu bahan dalam recipe produk. Matches admin/model.go Ingredient.
+      required: [name, qty, unit]
+      properties:
+        name: { type: string, description: Nama bahan }
+        qty: { type: number, format: float, description: Jumlah per 1 unit produk }
+        unit: { type: string, description: "Satuan ukur (ml, l, g, kg, pcs, dll)" }
+
+    AdminProduct:
+      type: object
+      description: >
+        Produk admin tanpa recipe. Matches admin/model.go AdminProduct.
+        recipe TIDAK ada di list item — hanya tersedia di AdminProductDetail (GET single).
+      properties:
+        id: { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        name: { type: string }
+        price: { type: integer, format: int64, description: IDR integer }
+        category: { type: string, nullable: true }
+        description: { type: string, nullable: true }
+        is_available: { type: boolean }
+        total_sold: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AdminProductDetail:
+      allOf:
+        - $ref: '#/components/schemas/AdminProduct'
+        - type: object
+          description: AdminProduct + recipe array. Matches admin/model.go AdminProductDetail.
+          properties:
+            recipe:
+              type: array
+              items: { $ref: '#/components/schemas/Ingredient' }
+              description: Daftar ingredient. Array kosong jika recipe belum diset.
+
+    AdminCreateProductRequest:
+      type: object
+      description: Body POST /admin/owners/{owner_id}/products. Matches admin/model.go AdminCreateProductRequest.
+      required: [name]
+      properties:
+        name: { type: string }
+        price: { type: integer, format: int64, minimum: 0, description: IDR integer; default 0 }
+        category: { type: string, nullable: true }
+        description: { type: string, nullable: true }
+        is_available: { type: boolean, nullable: true, description: Pointer di Go; nil = server default }
+
+    AdminUpdateProductRequest:
+      type: object
+      description: Body PATCH /admin/products/{product_id}. Matches admin/model.go AdminUpdateProductRequest. Semua field optional.
+      properties:
+        name: { type: string, nullable: true }
+        price: { type: integer, format: int64, minimum: 0, nullable: true }
+        category: { type: string, nullable: true }
+        description: { type: string, nullable: true }
+        is_available: { type: boolean, nullable: true }
+
+    # ---- Admin Transaction schemas ----
+
+    AdminTransaction:
+      type: object
+      description: Satu transaksi di view admin. Matches admin/model.go AdminTransaction.
+      properties:
+        id: { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        operator_id: { type: string, format: uuid, nullable: true }
+        order_id: { type: string, description: "Format KLAY-YYYYMMDD-xxxx" }
+        total_amount: { type: integer, format: int64, description: IDR integer }
+        payment_method: { type: string, nullable: true, description: Null sebelum CONFIRMED }
+        status: { type: string, description: DRAFT | PENDING | CONFIRMED | VOIDED }
+        note: { type: string, nullable: true }
+        paid_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AdminListTransactionsResult:
+      type: object
+      description: Response GET /admin/transactions. Matches admin/model.go AdminListTransactionsResult.
+      properties:
+        transactions:
+          type: array
+          items: { $ref: '#/components/schemas/AdminTransaction' }
+        total: { type: integer }
+        page: { type: integer }
+        limit: { type: integer }
 
     # ---- Transaction ----
 
