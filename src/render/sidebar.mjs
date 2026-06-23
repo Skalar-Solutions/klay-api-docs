@@ -22,7 +22,7 @@ export function renderSidebar(operations) {
     const links = g.operations.map(op => `
       <a class="nav__link" href="#${opId(op)}">
         <span class="nav__method nav__method--${op.method}">${op.method.toUpperCase()}</span>
-        <span class="nav__path">${escapeHtml(op.path)}</span>
+        <span class="nav__label">${escapeHtml(op.summary || op.path)}</span>
       </a>`).join('');
     return `<div class="nav__group"><div class="nav__tag">${escapeHtml(g.tag)}</div>${links}</div>`;
   }).join('');

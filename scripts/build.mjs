@@ -35,6 +35,7 @@ function main() {
   mkdirSync(join(ROOT, 'dist'), { recursive: true });
   writeFileSync(join(ROOT, 'dist', 'index.html'), html);
   copyFileSync(join(ROOT, 'src', 'styles.css'), join(ROOT, 'dist', 'styles.css'));
+  copyFileSync(join(ROOT, 'favicon.png'), join(ROOT, 'dist', 'favicon.png'));
   console.log(`Built dist/index.html — ${operations.length} operations`);
 }
 
