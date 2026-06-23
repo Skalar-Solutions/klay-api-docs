@@ -231,7 +231,7 @@ paths:
             schema:
               type: object
               properties:
-                name: { type: string }
+                full_name: { type: string }
                 phone: { type: string }
       responses:
         '200':
@@ -275,8 +275,8 @@ paths:
       tags: [Business]
       summary: Update info business (terbatas)
       description: >
-        Owner hanya bisa ubah field display: name, location, qris_static_payload.
-        Field plan, features, max_operators, status — admin Skalar only.
+        Owner hanya bisa ubah field display business. Field plan, features,
+        max_operators, status, xendit_status — admin Skalar only.
       security: [{ BearerAuth: [] }]
       requestBody:
         required: true
@@ -285,11 +285,13 @@ paths:
             schema:
               type: object
               properties:
-                name: { type: string }
-                location: { type: string }
-                qris_static_payload:
-                  type: string
-                  description: QRIS static string milik merchant (single, replace yang lama)
+                business_name: { type: string }
+                phone: { type: string }
+                address: { type: string }
+                city: { type: string }
+                country: { type: string }
+                qris_string: { type: string, description: "QRIS static payload merchant." }
+                category: { type: string }
       responses:
         '200':
           description: Business ter-update
@@ -348,7 +350,9 @@ paths:
       description: >
         Owner-only. Cap divalidasi terhadap business.max_operators
         (default 3, admin update kalo beli add-on, -1 = unlimited).
-        qr_token di-generate sekali dan dikembalikan di response ini saja.
+        Body hanya berisi name; server generate operator_code (KL-XXXXX),
+        PIN, dan qr_token. operator_code dan credential (qr_token/pin)
+        dikembalikan di response create/regenerate ini saja (one-time).
       security: [{ BearerAuth: [] }]
       requestBody:
         required: true
@@ -356,14 +360,14 @@ paths:
           application/json:
             schema:
               type: object
-              required: [name, operator_code, password]
+              required: [name]
               properties:
-                name: { type: string, example: Siti Kasir }
-                operator_code:
+                name:
                   type: string
-                  description: 3-64 char alfanumerik/dash/underscore, unik per-business
-                  example: kasir-1
-                password: { type: string, format: password }
+                  example: Siti Kasir
+                  description: >
+                    Satu-satunya field input. Server generate operator_code
+                    dan credential, dikembalikan di response.
       responses:
         '201':
           description: Operator dibuat
@@ -478,6 +482,86 @@ paths:
                   success: { type: boolean }
                   data: { $ref: '#/components/schemas/OperatorWithSecret' }
                   error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /business/operators/{operator_id}/qr:
+    get:
+      tags: [Operator]
+      summary: Ambil operator_code + qr_token operator
+      description: >
+        Owner-only. Mengembalikan operator_code dan qr_token saat ini
+        untuk re-render QR di dashboard tanpa regenerate.
+      security: [{ BearerAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Present in user/routes.go, absent from prior contract."
+      parameters:
+        - { name: operator_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: operator_code dan qr_token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      operator_code: { type: string }
+                      qr_token: { type: string }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /business/operators/{operator_id}/rotate:
+    post:
+      tags: [Operator]
+      summary: Rotate credential operator
+      description: >
+        Owner-only. Issue ulang qr_token dan PIN operator. Credential baru
+        dikembalikan satu kali (one-time) di response ini.
+      security: [{ BearerAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Present in user/routes.go, absent from prior contract."
+      parameters:
+        - { name: operator_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Credential operator ter-rotate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/OperatorWithSecret' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /business/operators/{operator_id}/force-logout:
+    post:
+      tags: [Operator]
+      summary: Paksa logout operator
+      description: >
+        Owner-only. Cabut sesi aktif operator (revoke refresh token).
+        Mengembalikan 204 No Content saat sukses.
+      security: [{ BearerAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Present in user/routes.go, absent from prior contract."
+      parameters:
+        - { name: operator_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204':
+          description: Sesi operator dicabut (no content)
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1630,10 +1714,10 @@ components:
       type: object
       properties:
         id: { type: string }
-        name: { type: string }
+        full_name: { type: string }
         email: { type: string, format: email }
         phone: { type: string, nullable: true }
-        role: { type: string, enum: [owner], description: Fixed value owner; admin punya endpoint terpisah }
+        role: { type: string, description: Diisi dari token (mis. owner). }
         business: { $ref: '#/components/schemas/Business' }
 
     # ---- Admin user ----
@@ -1662,32 +1746,23 @@ components:
 
     Business:
       type: object
-      description: Bentuk Business yang dilihat owner via /business.
+      description: >
+        Bentuk Business yang dikembalikan handler /business (user domain).
+        Field set diverifikasi terhadap businessResponse di user/model.go.
       properties:
-        id: { type: string, format: uuid, description: klay_id internal merchant }
-        name: { type: string }
-        location: { type: string }
-        category: { type: string }
-        owner_name: { type: string, description: Snapshot dari User.name saat onboarding, denormalized untuk display cepat }
-        owner_id: { type: string, format: uuid, description: Relasi ke User }
-        plan: { $ref: '#/components/schemas/PlanEnum' }
-        features:
-          type: array
-          items: { type: string }
-          description: Feature flags. Placeholder MVP. FE consume untuk gate UI elements.
-        max_operators: { type: integer, description: -1 = unlimited }
-        is_premium_user: { type: boolean, description: Derived dari plan; true kalau plan == max. FE consume buat UI treatment khusus. }
-        status: { $ref: '#/components/schemas/BusinessStatus' }
-        qris_static_payload:
+        id: { type: string, format: uuid }
+        klay_id: { type: string, description: Identifier merchant (KL-...). }
+        business_name: { type: string }
+        phone: { type: string, nullable: true }
+        address: { type: string, nullable: true }
+        city: { type: string, nullable: true }
+        country: { type: string, nullable: true }
+        xendit_status: { type: string, description: Status onboarding/akun Xendit merchant. }
+        qris_string:
           type: string
           nullable: true
-          description: QRIS static string milik merchant. Single per business. FE tampilkan saat method QRIS_STATIC dipilih.
-        onboarded_at: { type: string, format: date-time, nullable: true }
-        suspended_at: { type: string, format: date-time, nullable: true }
-        churned_at: { type: string, format: date-time, nullable: true }
-        last_active_at: { type: string, format: date-time, nullable: true, description: Auto-update tiap transaksi CONFIRMED. Source untuk inactivity insight. }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
+          description: QRIS static payload milik merchant. Single per business.
+        category: { type: string, nullable: true }
 
     BusinessLite:
       type: object
@@ -1702,7 +1777,27 @@ components:
       allOf:
         - $ref: '#/components/schemas/Business'
         - type: object
+          description: >
+            Admin-scoped business view. Admin-only fields (plan, status,
+            quota, lifecycle timestamps) live here, not on the owner-facing
+            Business schema. Reconciled separately in the Admin domain task.
           properties:
+            owner_name: { type: string, description: Snapshot dari User saat onboarding. }
+            owner_id: { type: string, format: uuid, description: Relasi ke User }
+            plan: { $ref: '#/components/schemas/PlanEnum' }
+            features:
+              type: array
+              items: { type: string }
+              description: Feature flags. Placeholder MVP.
+            max_operators: { type: integer, description: -1 = unlimited }
+            is_premium_user: { type: boolean }
+            status: { $ref: '#/components/schemas/BusinessStatus' }
+            onboarded_at: { type: string, format: date-time, nullable: true }
+            suspended_at: { type: string, format: date-time, nullable: true }
+            churned_at: { type: string, format: date-time, nullable: true }
+            last_active_at: { type: string, format: date-time, nullable: true }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
             onboarded_by: { type: string, format: uuid, nullable: true, description: Admin yang onboard, audit }
             onboard_notes: { type: string, nullable: true, description: Catatan deal-deal-an offline-first }
 
@@ -1715,8 +1810,9 @@ components:
         id: { type: string, format: uuid }
         business_id: { type: string, format: uuid }
         name: { type: string }
-        operator_code: { type: string, description: 3-64 char alfanumerik/dash/underscore, unik per-business }
+        operator_code: { type: string, description: Server-generated (KL-XXXXX), unik per-business }
         is_active: { type: boolean }
+        has_active_session: { type: boolean, description: Computed; true bila ada refresh token valid. }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -1727,7 +1823,10 @@ components:
           properties:
             qr_token:
               type: string
-              description: Token statis url-safe base64. Hanya dikembalikan saat create dan regenerate.
+              description: Token statis url-safe base64. Hanya dikembalikan saat create, rotate, dan regenerate.
+            pin:
+              type: string
+              description: PIN 6 digit. Hanya dikembalikan satu kali (one-time) saat create/rotate/regenerate.
 
     OperatorLoginResponse:
       type: object
