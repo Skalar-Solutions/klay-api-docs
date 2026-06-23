@@ -26,7 +26,10 @@ openapi: 3.0.3
 # ============================================================
 # Major changes from v0.3:
 #  - Xendit DROPPED. Full in-house transaction management.
-#  - Transaction status flow: PENDING -> CONFIRMED -> VOIDED
+#  - Order/transaction status flow: DRAFT -> PENDING -> CONFIRMED (via begin/confirm
+#    checkout), with VOIDED as a terminal branch. NOTE: PENDING exists as a stored
+#    order status but is REJECTED by the /transactions list-filter validation
+#    (transaction/handler.go), so the TransactionStatus filter enum is [DRAFT, CONFIRMED, VOIDED].
 #  - 3 payment methods MVP: CASH, QRIS_STATIC, TRANSFER
 #  - Manual confirmation by operator via slide-to-confirm gesture (>=800ms)
 #  - Recipe nested in product (structured JSON, ingredients[])
@@ -753,29 +756,314 @@ paths:
   # ==========================================================
   # TRANSACTION
   # ==========================================================
-  # Flow: POST /transactions (PENDING) -> POST .../confirm (CONFIRMED)
-  #       -> POST .../void (VOIDED) optional
-  # Method di-set saat confirm, bukan saat create.
-  # Slide-to-confirm gesture (>=800ms) di FE sebelum hit /confirm endpoint.
+  # RECONCILED to Go source of truth (order/ + transaction/ packages).
+  #
+  # Reality:
+  #   - There is NO `POST /transactions` and NO `POST /transactions/{id}/confirm`.
+  #     The create/checkout/void WRITE flow lives entirely under /orders
+  #     (order/routes.go), plus an owner-scoped void at POST /transactions/{id}/void.
+  #   - The /transactions GET endpoints are the READ-ONLY transaction log
+  #     (transaction/routes.go); writes were moved to the /orders domain.
+  #
+  # Write flow (order/routes.go, RequireOperator):
+  #   POST  /orders                            -> create DRAFT order
+  #   PATCH /orders/{order_id}/items           -> replace items while DRAFT
+  #   POST  /orders/{order_id}/checkout/begin  -> DRAFT -> PENDING (stamps checkout_started_at)
+  #   POST  /orders/{order_id}/checkout/confirm -> -> CONFIRMED (body: payment_method)
+  #   POST  /orders/{order_id}/void            -> operator void
+  #
+  # Owner void (order/routes.go, RequireOwner):
+  #   POST  /transactions/{id}/void            -> handled by order.VoidOrderByOwner
+  #
+  # Read flow (transaction/routes.go):
+  #   GET   /transactions                      -> List (RequireOwner)
+  #   GET   /transactions/{transaction_id}     -> GetByID (RequireOperator)
+  #   GET   /operator/transactions             -> OperatorList (RequireOperatorOnly)
+  #
+  # NOTE: response.NoContent() returns HTTP 200 with body {"success":true},
+  # NOT 204 No Content. Void endpoints therefore return 200, not 204.
   # ==========================================================
+
+  /orders:
+    post:
+      tags: [Transaction]
+      summary: Buat order baru (status DRAFT)
+      description: >
+        order.CreateOrder (RequireOperator). Status awal DRAFT.
+        Backend hitung total_amount dari items dan snapshot product_name +
+        unit_price ke order_items. operator_id diambil dari JWT (nullable kalau owner).
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [product_id, quantity]
+                    properties:
+                      product_id: { type: string, format: uuid }
+                      quantity: { type: integer, minimum: 1 }
+                note: { type: string, nullable: true, maxLength: 500 }
+      responses:
+        '201':
+          description: Order DRAFT dibuat (response.Created -> 201)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/TransactionDetail' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Body invalid, items kosong, atau produk tidak ditemukan/unavailable (ErrEmptyItems / ErrProductNotFound dipetakan ke 400 BadRequest)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+    get:
+      tags: [Transaction]
+      summary: List order milik operator yang login
+      description: >
+        order.ListMyOrders (RequireOperator). Hanya order milik operator dari JWT.
+        Kalau dipanggil owner (operator_id kosong) mengembalikan array kosong.
+        Response adalah array Transaction langsung di `data`, BUKAN object berpaginasi.
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Array order milik operator (atau [] untuk owner)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Transaction' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /orders/{order_id}/items:
+    patch:
+      tags: [Transaction]
+      summary: Ganti items order DRAFT
+      description: order.UpdateItems (RequireOperator). Hanya valid saat status DRAFT.
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: order_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [product_id, quantity]
+                    properties:
+                      product_id: { type: string, format: uuid }
+                      quantity: { type: integer, minimum: 1 }
+                note: { type: string, nullable: true, maxLength: 500 }
+      responses:
+        '200':
+          description: Order diperbarui
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/TransactionDetail' }
+                  error: { type: string, nullable: true }
+        '400': { description: Body invalid / produk tidak ditemukan, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Order tidak dalam status DRAFT (ErrNotDraft)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /orders/{order_id}/checkout/begin:
+    post:
+      tags: [Transaction]
+      summary: Mulai checkout (DRAFT -> PENDING)
+      description: >
+        order.BeginCheckout (RequireOperator). Stamp checkout_started_at dan pindah
+        status ke PENDING. Tidak ada request body. Wajib dipanggil sebelum confirm —
+        confirm tanpa begin menghasilkan ErrCheckoutNotStarted (400).
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: order_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Checkout dimulai, status PENDING
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/TransactionDetail' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Order tidak dalam status DRAFT (ErrNotDraft)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /orders/{order_id}/checkout/confirm:
+    post:
+      tags: [Transaction]
+      summary: Konfirmasi checkout (PENDING -> CONFIRMED)
+      description: >
+        order.ConfirmCheckout (RequireOperator). Body wajib `payment_method`.
+        Server menolak kalau begin-checkout belum dipanggil (ErrCheckoutNotStarted)
+        atau gesture terlalu cepat <800ms sejak checkout_started_at (ErrGestureTooFast).
+        Stamp confirmed_at + confirmed_by (string), lalu trigger consumption_log
+        dari product.recipe. Response menyertakan qris_string saat payment QRIS_STATIC.
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: order_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [payment_method]
+              properties:
+                payment_method: { $ref: '#/components/schemas/PaymentMethod' }
+      responses:
+        '200':
+          description: Order CONFIRMED. data = Order + qris_string (nullable, hanya QRIS_STATIC).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    allOf:
+                      - $ref: '#/components/schemas/Transaction'
+                      - type: object
+                        properties:
+                          qris_string: { type: string, nullable: true, description: Diisi hanya saat payment_method = QRIS_STATIC }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Body invalid atau checkout belum dimulai (ErrCheckoutNotStarted)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Order tidak PENDING (ErrNotPending) atau konfirmasi terlalu cepat <800ms (ErrGestureTooFast)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /orders/{order_id}/void:
+    post:
+      tags: [Transaction]
+      summary: Void order (operator)
+      description: >
+        order.VoidOrder (RequireOperator). Tidak ada request body. Mengembalikan
+        response.NoContent = HTTP 200 dengan body {"success":true} (BUKAN 204).
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: order_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Order di-void. Body {"success":true} tanpa data.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+          x-klay-flag:
+            kind: suspected-bug
+            note: "response.NoContent() returns 200 with {success:true}, not 204 No Content (pkg/response/response.go). Endpoint takes no request body, so void_reason is NOT captured on the operator void path."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /transactions/{id}/void:
+    post:
+      tags: [Transaction]
+      summary: Void order (owner)
+      description: >
+        order.VoidOrderByOwner (RequireOwner). Write mutation di domain order tapi
+        di-mount di path /transactions/{id}/void. Body wajib `void_reason`.
+        Owner identity diambil dari user_id JWT. Mengembalikan response.NoContent =
+        HTTP 200 dengan {"success":true} (BUKAN 204).
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [void_reason]
+              properties:
+                void_reason: { type: string, minLength: 1, maxLength: 500, description: Wajib diisi untuk audit }
+      responses:
+        '200':
+          description: Order di-void. Body {"success":true} tanpa data.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+          x-klay-flag:
+            kind: suspected-bug
+            note: "response.NoContent() returns 200 with {success:true}, not 204 (pkg/response/response.go). Path lives under /transactions but the handler is order.VoidOrderByOwner."
+        '400': { description: void_reason kosong / body invalid, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /transactions:
     get:
       tags: [Transaction]
-      summary: List transaksi business
-      description: Owner-only. Filter status, periode, payment method.
+      summary: List transaksi business (read-only log)
+      description: >
+        transaction.List (RequireOwner). Read-only history. status query menerima
+        hanya DRAFT/CONFIRMED/VOIDED — PENDING ditolak 400 oleh validasi list-filter.
       security: [{ BearerAuth: [] }]
       parameters:
-        - { name: start_date, in: query, schema: { type: string, format: date } }
-        - { name: end_date, in: query, schema: { type: string, format: date } }
-        - { name: status, in: query, schema: { $ref: '#/components/schemas/TransactionStatus' } }
+        - { name: start_date, in: query, schema: { type: string, format: date }, description: Format YYYY-MM-DD }
+        - { name: end_date, in: query, schema: { type: string, format: date }, description: Format YYYY-MM-DD }
+        - name: status
+          in: query
+          description: "Hanya DRAFT, CONFIRMED, VOIDED diterima. PENDING ditolak 400."
+          schema: { type: string, enum: [DRAFT, CONFIRMED, VOIDED] }
         - { name: payment_method, in: query, schema: { $ref: '#/components/schemas/PaymentMethod' } }
         - { name: operator_id, in: query, schema: { type: string, format: uuid } }
-        - { name: page, in: query, schema: { type: integer, default: 1 } }
-        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100 } }
       responses:
         '200':
-          description: List transaksi
+          description: List transaksi berpaginasi
           content:
             application/json:
               schema:
@@ -790,61 +1078,24 @@ paths:
                         items: { $ref: '#/components/schemas/Transaction' }
                       pagination: { $ref: '#/components/schemas/Pagination' }
                   error: { type: string, nullable: true }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-
-    post:
-      tags: [Transaction]
-      summary: Buat order baru (status PENDING)
-      description: >
-        Operator atau owner bikin order baru. Status awal: DRAFT.
-        Method belum di-set, baru di-set saat confirm.
-        Backend hitung total_amount dari items.
-        Snapshot product_name + unit_price ke transaction_items.
-      security: [{ BearerAuth: [] }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [items]
-              properties:
-                items:
-                  type: array
-                  items:
-                    type: object
-                    required: [product_id, quantity]
-                    properties:
-                      product_id: { type: string }
-                      quantity: { type: integer, minimum: 1 }
-                note: { type: string, nullable: true }
-      responses:
-        '201':
-          description: Order PENDING dibuat
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success: { type: boolean }
-                  data: { $ref: '#/components/schemas/TransactionDetail' }
-                  error: { type: string, nullable: true }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '422':
-          description: Produk tidak tersedia atau tidak ditemukan
+        '400':
+          description: Filter invalid (mis. status=PENDING, payment_method/tanggal/page/limit salah)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /transactions/{transaction_id}:
     get:
       tags: [Transaction]
       summary: Detail transaksi
-      description: Owner-only via dashboard. Operator akses transaksi sendiri lewat /operator/transactions/{id}.
+      description: >
+        transaction.GetByID (RequireOperator). Mengembalikan OrderWithItems
+        (Transaction + items[]).
       security: [{ BearerAuth: [] }]
       parameters:
-        - { name: transaction_id, in: path, required: true, schema: { type: string } }
+        - { name: transaction_id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
         '200':
           description: Detail transaksi
@@ -856,101 +1107,44 @@ paths:
                   success: { type: boolean }
                   data: { $ref: '#/components/schemas/TransactionDetail' }
                   error: { type: string, nullable: true }
+        '400': { description: transaction_id tidak valid, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
-  /transactions/{transaction_id}/confirm:
-    post:
+  /operator/transactions:
+    get:
       tags: [Transaction]
-      summary: Konfirmasi transaksi (PENDING -> CONFIRMED)
+      summary: List transaksi milik operator yang login
       description: >
-        Trigger oleh slide-to-confirm gesture di app operator (FE handle ≥800ms
-        threshold; server validasi checkout_started_at). Body wajib `payment_method`.
-        Bisa dari status DRAFT atau PENDING. Backend stamp confirmed_at +
-        confirmed_by (operator_id dari JWT atau null kalau owner langsung).
-        Sekaligus trigger background: consumption_log entry dari
-        product.recipe untuk tiap item.
+        transaction.OperatorList (RequireOperatorOnly). Operator-scoped — hanya
+        transaksi operator dari JWT. Filter: start_date, end_date, page, limit
+        (tidak ada filter status/payment_method/operator_id di endpoint ini).
       security: [{ BearerAuth: [] }]
       parameters:
-        - { name: transaction_id, in: path, required: true, schema: { type: string } }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [payment_method]
-              properties:
-                payment_method: { $ref: '#/components/schemas/PaymentMethod' }
-                note: { type: string, nullable: true, description: Catatan tambahan saat konfirmasi }
+        - { name: start_date, in: query, schema: { type: string, format: date }, description: Format YYYY-MM-DD }
+        - { name: end_date, in: query, schema: { type: string, format: date }, description: Format YYYY-MM-DD }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100 } }
       responses:
         '200':
-          description: Transaksi CONFIRMED
+          description: List transaksi operator berpaginasi
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   success: { type: boolean }
-                  data: { $ref: '#/components/schemas/TransactionDetail' }
+                  data:
+                    type: object
+                    properties:
+                      transactions:
+                        type: array
+                        items: { $ref: '#/components/schemas/Transaction' }
+                      pagination: { $ref: '#/components/schemas/Pagination' }
                   error: { type: string, nullable: true }
+        '400': { description: Filter invalid, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409':
-          description: Transaksi sudah CONFIRMED atau VOIDED, tidak bisa di-confirm lagi
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-
-  /transactions/{transaction_id}/void:
-    post:
-      tags: [Transaction]
-      summary: Void transaksi
-      description: >
-        Rules:
-          - Operator: hanya bisa void PENDING yang dia sendiri create
-            (confirmed_by null karena belum confirm; identified via
-            transaction.created_by_operator_id)
-          - Owner: bisa void status apapun di businessnya, no grace period
-          - Admin: bisa void cross-merchant override (via admin endpoint)
-        Audit trail: voided_at, voided_by (user_id atau operator_id),
-        void_reason wajib.
-      security: [{ BearerAuth: [] }]
-      parameters:
-        - { name: transaction_id, in: path, required: true, schema: { type: string } }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [void_reason]
-              properties:
-                void_reason: { type: string, description: Wajib diisi untuk audit }
-      responses:
-        '200':
-          description: Transaksi VOIDED
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success: { type: boolean }
-                  data: { $ref: '#/components/schemas/TransactionDetail' }
-                  error: { type: string, nullable: true }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403':
-          description: Operator coba void transaksi orang lain atau yang sudah CONFIRMED
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409':
-          description: Transaksi sudah VOIDED
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
 
   # ==========================================================
   # METRICS (OWNER ANALYTICS — SUMMARY, REPORTS, INSIGHT)
@@ -1893,12 +2087,17 @@ components:
 
     TransactionStatus:
       type: string
-      enum: [DRAFT, PENDING, CONFIRMED, VOIDED]
+      enum: [DRAFT, CONFIRMED, VOIDED]
       description: >
         DRAFT = order sedang diisi operator (default saat create).
-        PENDING = checkout dimulai, checkout_started_at di-stamp.
-        CONFIRMED = pembayaran dikonfirmasi via slide-to-confirm.
+        CONFIRMED = pembayaran dikonfirmasi.
         VOIDED = dibatalkan.
+        Catatan: PENDING ADA sebagai state internal order (DRAFT -> PENDING ->
+        CONFIRMED via begin/confirm checkout), tetapi DITOLAK oleh validasi filter
+        list transaksi (transaction/handler.go), jadi enum filter ini tidak memuatnya.
+      x-klay-flag:
+        kind: suspected-bug
+        note: "Code rejects PENDING (transaction/handler.go list-filter validation). Prior contract listed PENDING as a state. PENDING masih valid sebagai status order tersimpan, hanya tidak bisa dipakai sebagai nilai filter list."
 
     PaymentMethod:
       type: string
@@ -1910,32 +2109,36 @@ components:
 
     Transaction:
       type: object
+      description: >
+        Field-set direkonsiliasi ke order/model.go + transaction/model.go.
+        Mewakili satu baris orders. operator_name + item_count hanya di-set oleh
+        endpoint List (computed, bukan kolom langsung).
       properties:
-        id: { type: string }
-        order_id: { type: string, description: Format KLAY-YYYYMMDD-xxxx, ditampilkan ke operator/owner }
+        id: { type: string, format: uuid }
         business_id: { type: string, format: uuid }
+        operator_id: { type: string, format: uuid, nullable: true, description: Operator yang bikin order; null kalau owner langsung. (Sebelumnya salah dinamai created_by_operator_id.) }
+        order_id: { type: string, description: Format KLAY-YYYYMMDD-xxxx, ditampilkan ke operator/owner }
         total_amount: { type: integer, description: Sum dari items.subtotal, IDR integer }
+        payment_method: { allOf: [{ $ref: '#/components/schemas/PaymentMethod' }], nullable: true, description: Null sebelum confirm, di-set saat CONFIRMED }
         status: { $ref: '#/components/schemas/TransactionStatus' }
-        payment_method: { allOf: [{ $ref: '#/components/schemas/PaymentMethod' }], nullable: true, description: Null saat PENDING, di-set saat CONFIRMED }
-        created_by_operator_id: { type: string, format: uuid, nullable: true, description: Operator yang bikin order; null kalau owner langsung }
-        confirmed_by:
-          type: object
-          nullable: true
-          description: Siapa yang konfirmasi. Null saat PENDING.
-          properties:
-            type: { type: string, enum: [operator, owner] }
-            id: { type: string, format: uuid }
-        confirmed_at: { type: string, format: date-time, nullable: true }
-        voided_by:
-          type: object
-          nullable: true
-          properties:
-            type: { type: string, enum: [operator, owner, admin] }
-            id: { type: string, format: uuid }
-        voided_at: { type: string, format: date-time, nullable: true }
-        void_reason: { type: string, nullable: true }
         note: { type: string, nullable: true }
+        checkout_started_at: { type: string, format: date-time, nullable: true, description: Di-stamp saat begin-checkout (hanya ada di order/model.go, bukan transaction/model.go) }
+        confirmed_at: { type: string, format: date-time, nullable: true }
+        confirmed_by:
+          type: string
+          nullable: true
+          description: Siapa yang konfirmasi (string bebas). Null sebelum confirm.
+          x-klay-flag:
+            kind: suspected-bug
+            note: "confirmed_by is a bare string in order/model.go; prior contract modelled it as {type,id}. Auditor identity is not structured."
+        voided_at: { type: string, format: date-time, nullable: true }
+        void_reason: { type: string, nullable: true, description: "Diisi pada owner void. Operator void (POST /orders/:id/void) tidak menerima body sehingga tidak mengisi field ini." }
+        operator_name: { type: string, nullable: true, description: Computed; di-set hanya oleh GET /transactions List. }
+        item_count: { type: integer, description: Computed; di-set hanya oleh GET /transactions List. }
         created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      # NOTE: voided_by DIHAPUS — tidak ada di order/model.go maupun transaction/model.go.
+      # Identitas pem-void tidak dipersist sebagai kolom; hanya voided_at + void_reason yang tersimpan.
 
     TransactionDetail:
       allOf:
@@ -1950,7 +2153,8 @@ components:
       type: object
       description: Snapshot field. product_name dan unit_price di-freeze saat order dibuat agar histori akurat walau produk di-edit/delete kemudian.
       properties:
-        product_id: { type: string }
+        id: { type: string, format: uuid, description: ID baris order_items }
+        product_id: { type: string, format: uuid, nullable: true, description: Null kalau produk sumber sudah dihapus }
         product_name: { type: string, description: Snapshot saat transaksi dibuat }
         unit_price: { type: integer, description: Snapshot harga satuan saat transaksi dibuat, IDR integer }
         quantity: { type: integer }
