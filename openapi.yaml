@@ -513,7 +513,7 @@ paths:
                   type: string
                   description: Email atau klay_id business (resolves business).
                 operator_code: { type: string, minLength: 3, maxLength: 64 }
-                pin: { type: string, format: password, minLength: 4, maxLength: 12 }
+                pin: { type: string, format: password, minLength: 6, maxLength: 6, pattern: '^[0-9]{6}$', description: "Tepat 6 digit numerik (server: validate len=6,numeric)." }
       responses:
         '200':
           description: Login berhasil
