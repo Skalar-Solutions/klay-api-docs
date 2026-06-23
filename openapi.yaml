@@ -74,20 +74,23 @@ paths:
   /auth/login:
     post:
       tags: [Auth]
-      summary: Owner login dengan email dan password
+      summary: Owner login dengan identifier dan password
       description: >
-        Autentikasi owner. Email harus sudah di-create oleh admin Skalar
-        saat onboarding. Berhasil = access token di body, refresh token di
-        httpOnly cookie.
+        Autentikasi owner via identifier (email ATAU klay_id) + password.
+        Akun harus sudah di-create oleh admin Skalar saat onboarding.
+        Berhasil = access token di body, refresh token di httpOnly cookie.
+        Response data hanya berisi access_token (tidak ada nested user object).
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [email, password]
+              required: [identifier, password]
               properties:
-                email: { type: string, format: email }
+                identifier:
+                  type: string
+                  description: Email atau klay_id owner.
                 password: { type: string, format: password }
       responses:
         '200':
@@ -110,13 +113,19 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /auth/google:
+  /auth/google/login:
     post:
       tags: [Auth]
-      summary: Owner login dengan Google OAuth
+      summary: Owner login dengan Google OAuth (BELUM DIIMPLEMENTASI)
       description: >
-        Dipanggil NextAuth setelah Google OAuth berhasil. Server verifikasi
-        email terdaftar sebagai owner, lalu issue JWT Klay sendiri.
+        Handler saat ini mengembalikan 501 Not Implemented (auth/handler.go
+        GoogleLogin). Google OAuth login belum di-wire. Entri 200/403 di bawah
+        adalah kontrak yang dimaksudkan tapi belum dibangun: dipanggil NextAuth
+        setelah Google OAuth berhasil, server verifikasi email terdaftar sebagai
+        owner, lalu issue JWT Klay sendiri.
+      x-klay-flag:
+        kind: not-implemented
+        note: "Handler returns 501 Not Implemented (auth/handler.go). Google OAuth login is not wired yet."
       requestBody:
         required: true
         content:
@@ -129,7 +138,7 @@ paths:
                 name: { type: string }
       responses:
         '200':
-          description: Login berhasil
+          description: "[INTENDED, BELUM DIBANGUN] Login berhasil"
           headers:
             Set-Cookie:
               schema: { type: string }
@@ -137,7 +146,12 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/AuthSuccess' }
         '403':
-          description: Email belum terdaftar sebagai owner
+          description: "[INTENDED, BELUM DIBANGUN] Email belum terdaftar sebagai owner"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: Google login belum diimplementasi (perilaku aktual server)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -477,24 +491,29 @@ paths:
   # JWT scope: "operator" (cannot hit owner/admin endpoints)
   # ==========================================================
 
-  /operator/auth/login:
+  /kasir/auth/login:
     post:
       tags: [Operator]
       summary: Operator login dengan credential
       description: >
-        Endpoint public. business_id di FE resolved dari slug atau
-        QR onboarding device awal.
+        Endpoint public. identifier (email atau klay_id business) me-resolve
+        business; operator dicari via operator_code + PIN.
+      x-klay-flag:
+        kind: suspected-bug
+        note: "Path uses /kasir/ (not /operator/) in routes.go. Likely should be /operator/ for consistency with /operator/me."
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [business_id, operator_code, pin]
+              required: [identifier, operator_code, pin]
               properties:
-                business_id: { type: string, format: uuid }
+                identifier:
+                  type: string
+                  description: Email atau klay_id business (resolves business).
                 operator_code: { type: string, minLength: 3, maxLength: 64 }
-                pin: { type: string, format: password, minLength: 4, maxLength: 12, description: "PIN operator, hashed bcrypt di DB." }
+                pin: { type: string, format: password, minLength: 4, maxLength: 12 }
       responses:
         '200':
           description: Login berhasil
@@ -522,11 +541,14 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /operator/auth/login/qr:
+  /kasir/auth/login/qr:
     post:
       tags: [Operator]
       summary: Operator login dengan QR scan
       description: Endpoint public. qr_token statis, regenerate via owner.
+      x-klay-flag:
+        kind: suspected-bug
+        note: "Path uses /kasir/ (not /operator/) in routes.go. Likely should be /operator/ for consistency with /operator/me."
       requestBody:
         required: true
         content:
@@ -1600,7 +1622,6 @@ components:
           type: object
           properties:
             access_token: { type: string }
-            user: { $ref: '#/components/schemas/UserWithBusiness' }
         error: { type: string, nullable: true }
 
     # ---- User (owner) ----
