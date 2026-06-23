@@ -32,8 +32,11 @@ openapi: 3.0.3
 #    (transaction/handler.go), so the TransactionStatus filter enum is [DRAFT, CONFIRMED, VOIDED].
 #  - 3 payment methods MVP: CASH, QRIS_STATIC, TRANSFER
 #  - Manual confirmation by operator via slide-to-confirm gesture (>=800ms)
-#  - Recipe nested in product (structured JSON, ingredients[])
-#  - Product CRUD moved to admin domain (owner read-only)
+#  - RECONCILED: Product struct has NO recipe field (product/model.go); RecipeIngredient
+#    schema is unused by the product API. Consumption tracking has no product-side source.
+#  - RECONCILED: Owner-facing Product CRUD lives at /products (POST/PATCH/DELETE,
+#    RequireOwner); GET is owner+operator (RequireOperator). Not admin-only.
+#    GET /products wraps data as { products: [...] }. Admin /admin*/products is separate.
 #  - Admin domain added (Skalar staff onboarding + management surface)
 #  - Plan + features merged into Business (no separate Plans/Subs tables)
 #  - Business lifecycle tracking: enum status + event timestamps
@@ -699,27 +702,43 @@ paths:
   # FE dashboard kasih info copy "Untuk edit produk, hubungi tim Skalar."
   # ==========================================================
 
+  # ==========================================================
+  # PRODUCT
+  # ==========================================================
+  # RECONCILED to Go source of truth (product/ package).
+  #
+  # routes.go: group "/products" wrapped by authMiddleware + RateLimitOwner.
+  #   GET    /products              -> List    (RequireOperator) owner+operator read
+  #   GET    /products/:product_id  -> GetByID (RequireOperator) owner+operator read
+  #   POST   /products              -> Create  (RequireOwner)    owner-only write
+  #   PATCH  /products/:product_id  -> Update  (RequireOwner)    owner-only write
+  #   DELETE /products/:product_id  -> Delete  (RequireOwner)    owner-only write
+  #
+  # Owner-facing product CRUD lives HERE at /products, not under /admin.
+  # Prior contract wrongly said product writes were admin-only.
+  #
+  # Shapes (product/handler.go):
+  #   List    -> response.OK     => 200 { success, data: { products: [Product] }, error }
+  #   GetByID -> response.OK      => 200 { success, data: Product, error }
+  #   Create  -> response.Created => 201 { success, data: Product, error }
+  #   Update  -> response.OK      => 200 { success, data: Product, error }
+  #   Delete  -> response.NoContent => 200 { success:true } (NOT 204)
+  #
+  # NOTE: handler does not read category/q/sort/is_available query params;
+  # service.List takes only businessID. Prior filter/sort params were fictional.
+  # ==========================================================
+
   /products:
     get:
       tags: [Product]
       summary: List produk business
       description: >
-        Owner & operator bisa GET. Mendukung filter kategori, search,
-        dan sort. is_available filter optional buat operator hide produk
-        yang lagi habis.
+        Owner & operator (RequireOperator) bisa GET. Handler hanya pakai business_id
+        dari JWT; tidak ada query filter/sort/search yang diproses oleh server.
       security: [{ BearerAuth: [] }]
-      parameters:
-        - { name: category, in: query, schema: { type: string } }
-        - { name: q, in: query, schema: { type: string }, description: Search nama produk }
-        - name: sort
-          in: query
-          schema: { type: string, enum: [name, popular, created_at], default: popular }
-        - name: is_available
-          in: query
-          schema: { type: boolean }
       responses:
         '200':
-          description: List produk
+          description: List produk (data dibungkus sebagai object { products: [...] })
           content:
             application/json:
               schema:
@@ -727,18 +746,54 @@ paths:
                 properties:
                   success: { type: boolean }
                   data:
-                    type: array
-                    items: { $ref: '#/components/schemas/Product' }
+                    type: object
+                    properties:
+                      products:
+                        type: array
+                        items: { $ref: '#/components/schemas/Product' }
                   error: { type: string, nullable: true }
         '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Product]
+      summary: Tambah produk (owner only)
+      description: >
+        RequireOwner. business_id diambil dari JWT, bukan body.
+      security: [{ BearerAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Owner-facing product CRUD exists at /products in routes.go; prior contract said admin-only."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProductRequest' }
+      responses:
+        '201':
+          description: Produk dibuat
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Product' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Body invalid atau gagal validasi
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /products/{product_id}:
+    parameters:
+      - { name: product_id, in: path, required: true, schema: { type: string, format: uuid } }
     get:
       tags: [Product]
       summary: Detail produk
+      description: Owner & operator (RequireOperator).
       security: [{ BearerAuth: [] }]
-      parameters:
-        - { name: product_id, in: path, required: true, schema: { type: string } }
       responses:
         '200':
           description: Detail produk
@@ -751,6 +806,61 @@ paths:
                   data: { $ref: '#/components/schemas/Product' }
                   error: { type: string, nullable: true }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Product]
+      summary: Update produk (owner only, partial)
+      description: >
+        RequireOwner. Partial update — field yang tidak dikirim tidak berubah.
+      security: [{ BearerAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Owner-facing product CRUD exists at /products in routes.go; prior contract said admin-only."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateProductRequest' }
+      responses:
+        '200':
+          description: Produk ter-update
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Product' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Body invalid atau product_id tidak valid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Product]
+      summary: Hapus produk (owner only)
+      description: RequireOwner.
+      security: [{ BearerAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Owner-facing product CRUD exists at /products in routes.go; prior contract said admin-only."
+      responses:
+        '200':
+          description: >
+            Produk dihapus. response.NoContent() mengembalikan HTTP 200 dengan body
+            { success: true }, BUKAN 204 No Content.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   # ==========================================================
@@ -2029,11 +2139,14 @@ components:
         operator: { $ref: '#/components/schemas/Operator' }
         business: { $ref: '#/components/schemas/BusinessLite' }
 
-    # ---- Product (with nested recipe) ----
+    # ---- Product ----
 
     RecipeIngredient:
       type: object
       description: Satu bahan dalam recipe produk. Structured biar mesin bisa aggregate untuk consumption_log.
+      x-klay-flag:
+        kind: suspected-bug
+        note: "Schema tidak dipakai oleh product API. product/model.go Product TIDAK punya field recipe, dan CreateProductRequest/UpdateProductRequest tidak menerima recipe. RecipeIngredient dipertahankan hanya sebagai referensi domain consumption-tracking; tidak ada endpoint product yang mengembalikan atau menerimanya."
       required: [name, qty, unit]
       properties:
         name:
@@ -2050,24 +2163,47 @@ components:
     Product:
       type: object
       description: >
-        1 ibu (produk) dengan anak-anak (description, recipe, etc) di 1 JSON body.
-        Recipe structured array, di-parse untuk consumption tracking saat
-        transaksi CONFIRMED.
+        Representasi satu baris tabel products, direkonsiliasi ke product/model.go.
+        Tidak ada nested recipe — Product struct tidak punya field recipe.
+      x-klay-flag:
+        kind: suspected-bug
+        note: "Product has no recipe field in product/model.go; consumption tracking depends on a recipe the product API does not expose."
       properties:
-        id: { type: string }
+        id: { type: string, format: uuid }
         business_id: { type: string, format: uuid }
         name: { type: string }
-        price: { type: integer, description: IDR integer, no decimal }
+        price: { type: integer, format: int64, description: IDR integer, no decimal (int64) }
         category: { type: string, nullable: true }
         description: { type: string, nullable: true, description: Teks bebas, marketing copy }
-        recipe:
-          type: array
-          items: { $ref: '#/components/schemas/RecipeIngredient' }
-          description: Komposisi structured. Empty array kalau produk gak punya recipe (misal jasa).
         is_available: { type: boolean, description: Operator hide produk yang lagi habis }
         total_sold: { type: integer, description: Total unit CONFIRMED, untuk sort popular }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    CreateProductRequest:
+      type: object
+      description: >
+        Body POST /products (product/model.go CreateProductRequest).
+        Tidak ada field recipe. business_id berasal dari JWT, bukan body.
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 255 }
+        price: { type: integer, format: int64, minimum: 0, description: IDR integer; default 0 kalau tidak dikirim }
+        category: { type: string, nullable: true, minLength: 1, maxLength: 100 }
+        description: { type: string, nullable: true, maxLength: 2000 }
+        is_available: { type: boolean, nullable: true, description: Pointer di Go; nil = pakai default service }
+
+    UpdateProductRequest:
+      type: object
+      description: >
+        Body PATCH /products/{product_id} (product/model.go UpdateProductRequest).
+        Semua field optional (pointer) — partial update. Tidak ada field recipe.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 255 }
+        price: { type: integer, format: int64, minimum: 0 }
+        category: { type: string, nullable: true, minLength: 1, maxLength: 100 }
+        description: { type: string, nullable: true, maxLength: 2000 }
+        is_available: { type: boolean, nullable: true }
 
     ProductInput:
       type: object
