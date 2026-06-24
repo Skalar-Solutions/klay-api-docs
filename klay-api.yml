@@ -1,0 +1,2759 @@
+openapi: 3.0.3
+
+# ============================================================
+# KLAY-API CONTRACT v0.7 — SERVER FIXES APPLIED (2026-06-24)
+# Breaking changes: /kasir/auth/* → /operator/auth/*, /orders/sessions removed.
+# ============================================================
+# This version was reconciled endpoint-by-endpoint against the Go
+# implementation in klay-server/apps/api/core/. Where the code and the
+# prior contract disagreed, the CODE is authoritative. Behaviour that
+# looks like a bug or unfinished work is documented as-is and marked with
+# the `x-klay-flag` vendor extension (kind: suspected-bug | not-implemented
+# | undocumented) so it renders as a warning badge in the docs.
+# ============================================================
+
+# ============================================================
+# KLAY-API CONTRACT v0.5
+# ============================================================
+# Major changes from v0.4:
+#  - Order domain: /pos/orders/* renamed to /orders/*, /pos/sessions -> /orders/sessions
+#  - Metrics domain: /dashboard/*, /analytics/*, /reports/*, /insight -> /metrics/*
+#  - Bug fix: dashboard/report queries used status='paid' (invalid). Fixed to 'CONFIRMED'.
+#  - Tags: Dashboard/Analytics/Report/Insight merged into Metrics; POS tag renamed to Order.
+#  - Table renames in migration 014: pos_orders->orders, pos_order_items->order_items,
+#    pos_sessions->order_sessions, FK column pos_order_id->order_id.
+#  - Request hardening: BodyLimit 2M, Timeout 30s, IPExtractor XFF.
+#  - Rate limiting: per-scope per user_id (Owner 100/min, Operator 60/min, Admin 200/min).
+# ============================================================
+# Major changes from v0.3:
+#  - Xendit DROPPED. Full in-house transaction management.
+#  - Order/transaction status flow: DRAFT -> PENDING -> CONFIRMED (via begin/confirm
+#    checkout), with VOIDED as a terminal branch. NOTE: PENDING exists as a stored
+#    order status but is REJECTED by the /transactions list-filter validation
+#    (transaction/handler.go), so the TransactionStatus filter enum is [DRAFT, CONFIRMED, VOIDED].
+#  - 3 payment methods MVP: CASH, QRIS_STATIC, TRANSFER
+#  - Manual confirmation by operator via slide-to-confirm gesture (>=800ms)
+#  - RECONCILED: Product struct has NO recipe field (product/model.go); RecipeIngredient
+#    schema is unused by the product API. Consumption tracking has no product-side source.
+#  - RECONCILED: Owner-facing Product CRUD lives at /products (POST/PATCH/DELETE,
+#    RequireOwner); GET is owner+operator (RequireOperator). Not admin-only.
+#    GET /products wraps data as { products: [...] }. Admin /admin*/products is separate.
+#  - Admin domain added (Skalar staff onboarding + management surface)
+#  - Plan + features merged into Business (no separate Plans/Subs tables)
+#  - Business lifecycle tracking: enum status + event timestamps
+#  - Report domain added (daily/monthly sales, consumption, export)
+#  - No public registration. Onboarding offline-first via admin Skalar.
+#  - Auto-forward WA/Telegram add-on deferred (post-MVP)
+# ============================================================
+
+info:
+  title: Klay API
+  description: >
+    API contract antara client (Next.js dashboard + PWA operator terpisah) dan
+    server (Go + Echo) untuk platform Klay.
+    Klay adalah business intelligence layer untuk UMKM dengan in-house
+    transaction management. Tiga role utama: owner (akses dashboard),
+    operator (akses PWA operator), dan admin (staff Skalar, akses admin panel).
+  version: 0.7.0
+  contact:
+    name: Klay Development Team
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: https://api.klay.id
+    description: Production
+
+# ============================================================
+# PATHS
+# ============================================================
+
+paths:
+
+  # ==========================================================
+  # AUTH (OWNER)
+  # ==========================================================
+  # Owner login flow. Email/password atau Google OAuth.
+  # Refresh token disimpan di httpOnly cookie.
+  # No public registration. Owner di-onboard tim Skalar.
+  # ==========================================================
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Owner login dengan identifier dan password
+      description: >
+        Autentikasi owner via identifier (email ATAU klay_id) + password.
+        Akun harus sudah di-create oleh admin Skalar saat onboarding.
+        Berhasil = access token di body, refresh token di httpOnly cookie.
+        Response data hanya berisi access_token (tidak ada nested user object).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identifier, password]
+              properties:
+                identifier:
+                  type: string
+                  description: Email atau klay_id owner.
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: Login berhasil
+          headers:
+            Set-Cookie:
+              description: Refresh token httpOnly cookie
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthSuccess' }
+        '401':
+          description: Email atau password salah
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Akun ditemukan tapi business status SUSPENDED atau CHURNED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/google/login:
+    post:
+      tags: [Auth]
+      summary: Owner login dengan Google OAuth (BELUM DIIMPLEMENTASI)
+      description: >
+        Handler saat ini mengembalikan 501 Not Implemented (auth/handler.go
+        GoogleLogin). Google OAuth login belum di-wire. Entri 200/403 di bawah
+        adalah kontrak yang dimaksudkan tapi belum dibangun: dipanggil NextAuth
+        setelah Google OAuth berhasil, server verifikasi email terdaftar sebagai
+        owner, lalu issue JWT Klay sendiri.
+      x-klay-flag:
+        kind: not-implemented
+        note: "Handler returns 501 Not Implemented (auth/handler.go). Google OAuth login is not wired yet."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, name]
+              properties:
+                email: { type: string, format: email }
+                name: { type: string }
+      responses:
+        '200':
+          description: "[INTENDED, BELUM DIBANGUN] Login berhasil"
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthSuccess' }
+        '403':
+          description: "[INTENDED, BELUM DIBANGUN] Email belum terdaftar sebagai owner"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: Google login belum diimplementasi (perilaku aktual server)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Refresh access token
+      description: Baca refresh token dari httpOnly cookie, issue access token baru.
+      responses:
+        '200':
+          description: Access token baru
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      access_token: { type: string }
+                  error: { type: string, nullable: true }
+        '401':
+          description: Refresh token tidak valid atau expired
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout
+      description: Hapus refresh token dari httpOnly cookie.
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Logout berhasil
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ==========================================================
+  # USER (OWNER PROFILE)
+  # ==========================================================
+
+  /users/me:
+    get:
+      tags: [User]
+      summary: Profil owner yang sedang login
+      description: Mengembalikan profil owner beserta data business yang terkait.
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Profil berhasil diambil
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/UserWithBusiness' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+    patch:
+      tags: [User]
+      summary: Update profil owner
+      description: >
+        Owner update nama atau phone. Tidak bisa ubah email (admin Skalar only).
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                full_name: { type: string }
+                phone: { type: string }
+      responses:
+        '200':
+          description: Profil ter-update
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/UserWithBusiness' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ==========================================================
+  # BUSINESS
+  # ==========================================================
+  # Owner endpoint untuk lihat dan update business info terbatas.
+  # Plan, features, max_operators, status — hanya admin Skalar yang bisa ubah.
+  # ==========================================================
+
+  /business:
+    get:
+      tags: [Business]
+      summary: Detail business owner yang login
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Data business
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Business' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+    patch:
+      tags: [Business]
+      summary: Update info business (terbatas)
+      description: >
+        Owner hanya bisa ubah field display business. Field plan, features,
+        max_operators, status, xendit_status — admin Skalar only.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                business_name: { type: string }
+                phone: { type: string }
+                address: { type: string }
+                city: { type: string }
+                country: { type: string }
+                qris_string: { type: string, description: "QRIS static payload merchant." }
+                category: { type: string }
+      responses:
+        '200':
+          description: Business ter-update
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Business' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ==========================================================
+  # OPERATOR (DASHBOARD MANAGEMENT)
+  # ==========================================================
+  # Owner manage operator dari dashboard.
+  # Admin Skalar hanya bisa REMOVE operator on request (di admin domain).
+  # ==========================================================
+
+  /business/operators:
+    get:
+      tags: [Operator]
+      summary: List operator business
+      description: >
+        Daftar operator + info kuota. qr_token tidak dikembalikan di list,
+        hanya saat create dan regenerate.
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: List operator
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      operators:
+                        type: array
+                        items: { $ref: '#/components/schemas/Operator' }
+                      slot_used: { type: integer }
+                      slot_max:
+                        type: integer
+                        description: -1 = unlimited
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+    post:
+      tags: [Operator]
+      summary: Tambah operator baru
+      description: >
+        Owner-only. Cap divalidasi terhadap business.max_operators
+        (default 3, admin update kalo beli add-on, -1 = unlimited).
+        Body hanya berisi name; server generate operator_code (KL-XXXXX),
+        PIN, dan qr_token. operator_code dan credential (qr_token/pin)
+        dikembalikan di response create/regenerate ini saja (one-time).
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  example: Siti Kasir
+                  description: >
+                    Satu-satunya field input. Server generate operator_code
+                    dan credential, dikembalikan di response.
+      responses:
+        '201':
+          description: Operator dibuat
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/OperatorWithSecret' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Input tidak valid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: operator_code sudah dipakai atau slot penuh
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /business/operators/{operator_id}:
+    parameters:
+      - { name: operator_id, in: path, required: true, schema: { type: string, format: uuid } }
+
+    get:
+      tags: [Operator]
+      summary: Detail satu operator
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Operator ditemukan
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Operator' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+    put:
+      tags: [Operator]
+      summary: Update operator (partial)
+      description: Owner update name atau is_active. Reset password dan QR di endpoint terpisah.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                is_active: { type: boolean }
+      responses:
+        '200':
+          description: Operator ter-update
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Operator' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+    delete:
+      tags: [Operator]
+      summary: Hapus operator (soft delete)
+      description: >
+        Soft delete — deleted_at di-set, row tetap ada. operator_code TIDAK dibebaskan
+        (tetap tersimpan di row, slot unique index terpakai). Operator tidak bisa login lagi.
+        Slot operator aktif berkurang (COUNT is_active turun). Data historis tetap valid.
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Operator dihapus
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /business/operators/{operator_id}/regenerate-qr:
+    post:
+      tags: [Operator]
+      summary: Regenerate qr_token operator
+      description: >
+        Issue qr_token baru. QR lama tidak valid untuk login baru, tapi
+        sesi JWT yang masih aktif tetap berlaku sampai access token expired.
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: operator_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: QR baru
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/OperatorWithSecret' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /business/operators/{operator_id}/qr:
+    get:
+      tags: [Operator]
+      summary: Ambil operator_code + qr_token operator
+      description: >
+        Owner-only. Mengembalikan operator_code dan qr_token saat ini
+        untuk re-render QR di dashboard tanpa regenerate.
+      security: [{ BearerAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Present in user/routes.go, absent from prior contract."
+      parameters:
+        - { name: operator_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: operator_code dan qr_token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      operator_code: { type: string }
+                      qr_token: { type: string }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /business/operators/{operator_id}/rotate:
+    post:
+      tags: [Operator]
+      summary: Rotate credential operator
+      description: >
+        Owner-only. Issue ulang qr_token dan PIN operator. Credential baru
+        dikembalikan satu kali (one-time) di response ini.
+      security: [{ BearerAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Present in user/routes.go, absent from prior contract."
+      parameters:
+        - { name: operator_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Credential operator ter-rotate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/OperatorWithSecret' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /business/operators/{operator_id}/force-logout:
+    post:
+      tags: [Operator]
+      summary: Paksa logout operator
+      description: >
+        Owner-only. Cabut sesi aktif operator (revoke refresh token).
+        Mengembalikan 204 No Content saat sukses.
+      security: [{ BearerAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Present in user/routes.go, absent from prior contract."
+      parameters:
+        - { name: operator_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204':
+          description: Sesi operator dicabut (no content)
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==========================================================
+  # OPERATOR AUTH (PWA LOGIN)
+  # ==========================================================
+  # PWA operator terpisah dari dashboard. Operator login via:
+  #  - business_id + operator_code + pin (fallback)
+  #  - qr_token (primary, faster)
+  # JWT scope: "operator" (cannot hit owner/admin endpoints)
+  # ==========================================================
+
+  /operator/auth/login:
+    post:
+      tags: [Operator]
+      summary: Operator login dengan credential
+      description: >
+        Endpoint public. identifier (email atau klay_id business) me-resolve
+        business; operator dicari via operator_code + PIN.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identifier, operator_code, pin]
+              properties:
+                identifier:
+                  type: string
+                  description: Email atau klay_id business (resolves business).
+                operator_code: { type: string, minLength: 3, maxLength: 64 }
+                pin: { type: string, format: password, minLength: 6, maxLength: 6, pattern: '^[0-9]{6}$', description: "Tepat 6 digit numerik (server: validate len=6,numeric)." }
+      responses:
+        '200':
+          description: Login berhasil
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/OperatorLoginResponse' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Input tidak valid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: Credential salah
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Operator non-aktif atau business SUSPENDED/CHURNED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /operator/auth/login/qr:
+    post:
+      tags: [Operator]
+      summary: Operator login dengan QR scan
+      description: Endpoint public. qr_token statis, regenerate via owner.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [qr_token]
+              properties:
+                qr_token: { type: string }
+      responses:
+        '200':
+          description: Login berhasil
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/OperatorLoginResponse' }
+                  error: { type: string, nullable: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: qr_token tidak valid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Operator non-aktif atau business SUSPENDED/CHURNED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /operator/me:
+    get:
+      tags: [Operator]
+      summary: Profil operator yang sedang login (PWA operator)
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Profil operator
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      operator: { $ref: '#/components/schemas/Operator' }
+                      business: { $ref: '#/components/schemas/BusinessLite' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ==========================================================
+  # PRODUCT (OWNER READ-ONLY)
+  # ==========================================================
+  # Owner GET only. CRUD product ada di admin domain.
+  # Recipe nested di product object (structured ingredients[]).
+  # Owner submit perubahan produk = contact tim Skalar di luar sistem.
+  # FE dashboard kasih info copy "Untuk edit produk, hubungi tim Skalar."
+  # ==========================================================
+
+  # ==========================================================
+  # PRODUCT
+  # ==========================================================
+  # RECONCILED to Go source of truth (product/ package).
+  #
+  # routes.go: group "/products" wrapped by authMiddleware + RateLimitOwner.
+  #   GET    /products              -> List    (RequireOperator) owner+operator read
+  #   GET    /products/:product_id  -> GetByID (RequireOperator) owner+operator read
+  #   POST   /products              -> Create  (RequireOwner)    owner-only write
+  #   PATCH  /products/:product_id  -> Update  (RequireOwner)    owner-only write
+  #   DELETE /products/:product_id  -> Delete  (RequireOwner)    owner-only write
+  #
+  # Owner-facing product CRUD lives HERE at /products, not under /admin.
+  # Prior contract wrongly said product writes were admin-only.
+  #
+  # Shapes (product/handler.go):
+  #   List    -> response.OK     => 200 { success, data: { products: [Product] }, error }
+  #   GetByID -> response.OK      => 200 { success, data: Product, error }
+  #   Create  -> response.Created => 201 { success, data: Product, error }
+  #   Update  -> response.OK      => 200 { success, data: Product, error }
+  #   Delete  -> response.NoContent => 200 { success:true } (NOT 204)
+  #
+  # NOTE: handler does not read category/q/sort/is_available query params;
+  # service.List takes only businessID. Prior filter/sort params were fictional.
+  # ==========================================================
+
+  /products:
+    get:
+      tags: [Product]
+      summary: List produk business
+      description: >
+        Owner & operator (RequireOperator) bisa GET. Handler hanya pakai business_id
+        dari JWT; tidak ada query filter/sort/search yang diproses oleh server.
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: "List produk (data dibungkus sebagai object { products: [...] })"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      products:
+                        type: array
+                        items: { $ref: '#/components/schemas/Product' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Product]
+      summary: Tambah produk (owner only)
+      description: >
+        RequireOwner. business_id diambil dari JWT, bukan body.
+      security: [{ BearerAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Owner-facing product CRUD exists at /products in routes.go; prior contract said admin-only."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProductRequest' }
+      responses:
+        '201':
+          description: Produk dibuat
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Product' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Body invalid atau gagal validasi
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /products/{product_id}:
+    parameters:
+      - { name: product_id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Product]
+      summary: Detail produk
+      description: Owner & operator (RequireOperator).
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Detail produk
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Product' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Product]
+      summary: Update produk (owner only, partial)
+      description: >
+        RequireOwner. Partial update — field yang tidak dikirim tidak berubah.
+      security: [{ BearerAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Owner-facing product CRUD exists at /products in routes.go; prior contract said admin-only."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateProductRequest' }
+      responses:
+        '200':
+          description: Produk ter-update
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Product' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Body invalid atau product_id tidak valid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Product]
+      summary: Hapus produk (owner only)
+      description: RequireOwner.
+      security: [{ BearerAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Owner-facing product CRUD exists at /products in routes.go; prior contract said admin-only."
+      responses:
+        '200':
+          description: >
+            Produk dihapus. response.NoContent() mengembalikan HTTP 200 dengan body
+            { success: true }, BUKAN 204 No Content.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==========================================================
+  # TRANSACTION
+  # ==========================================================
+  # RECONCILED to Go source of truth (order/ + transaction/ packages).
+  #
+  # Reality:
+  #   - There is NO `POST /transactions` and NO `POST /transactions/{id}/confirm`.
+  #     The create/checkout/void WRITE flow lives entirely under /orders
+  #     (order/routes.go), plus an owner-scoped void at POST /transactions/{id}/void.
+  #   - The /transactions GET endpoints are the READ-ONLY transaction log
+  #     (transaction/routes.go); writes were moved to the /orders domain.
+  #
+  # Write flow (order/routes.go, RequireOperator):
+  #   POST  /orders                            -> create DRAFT order
+  #   PATCH /orders/{order_id}/items           -> replace items while DRAFT
+  #   POST  /orders/{order_id}/checkout/begin  -> DRAFT -> PENDING (stamps checkout_started_at)
+  #   POST  /orders/{order_id}/checkout/confirm -> -> CONFIRMED (body: payment_method)
+  #   POST  /orders/{order_id}/void            -> operator void
+  #
+  # Owner void (order/routes.go, RequireOwner):
+  #   POST  /transactions/{id}/void            -> handled by order.VoidOrderByOwner
+  #
+  # Read flow (transaction/routes.go):
+  #   GET   /transactions                      -> List (RequireOwner)
+  #   GET   /transactions/{transaction_id}     -> GetByID (RequireOperator)
+  #   GET   /operator/transactions             -> OperatorList (RequireOperatorOnly)
+  #
+  # NOTE: response.NoContent() returns HTTP 200 with body {"success":true},
+  # NOT 204 No Content. Void endpoints therefore return 200, not 204.
+  # ==========================================================
+
+  /orders:
+    post:
+      tags: [Transaction]
+      summary: Buat order baru (status DRAFT)
+      description: >
+        order.CreateOrder (RequireOperator). Status awal DRAFT.
+        Backend hitung total_amount dari items dan snapshot product_name +
+        unit_price ke order_items. operator_id diambil dari JWT (nullable kalau owner).
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [product_id, quantity]
+                    properties:
+                      product_id: { type: string, format: uuid }
+                      quantity: { type: integer, minimum: 1 }
+                note: { type: string, nullable: true, maxLength: 500 }
+      responses:
+        '201':
+          description: Order DRAFT dibuat (response.Created -> 201)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/TransactionDetail' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Body invalid, items kosong, atau produk tidak ditemukan/unavailable (ErrEmptyItems / ErrProductNotFound dipetakan ke 400 BadRequest)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+    get:
+      tags: [Transaction]
+      summary: List order milik operator yang login
+      description: >
+        order.ListMyOrders (RequireOperator). Hanya order milik operator dari JWT.
+        Kalau dipanggil owner (operator_id kosong) mengembalikan array kosong.
+        Response adalah array Transaction langsung di `data`, BUKAN object berpaginasi.
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Array order milik operator (atau [] untuk owner)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Transaction' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /orders/{order_id}/items:
+    patch:
+      tags: [Transaction]
+      summary: Ganti items order DRAFT
+      description: order.UpdateItems (RequireOperator). Hanya valid saat status DRAFT.
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: order_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [product_id, quantity]
+                    properties:
+                      product_id: { type: string, format: uuid }
+                      quantity: { type: integer, minimum: 1 }
+                note: { type: string, nullable: true, maxLength: 500 }
+      responses:
+        '200':
+          description: Order diperbarui
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/TransactionDetail' }
+                  error: { type: string, nullable: true }
+        '400': { description: Body invalid / produk tidak ditemukan, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Order tidak dalam status DRAFT (ErrNotDraft)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /orders/{order_id}/checkout/begin:
+    post:
+      tags: [Transaction]
+      summary: Mulai checkout (DRAFT -> PENDING)
+      description: >
+        order.BeginCheckout (RequireOperator). Stamp checkout_started_at dan pindah
+        status ke PENDING. Tidak ada request body. Wajib dipanggil sebelum confirm —
+        confirm tanpa begin menghasilkan ErrCheckoutNotStarted (400).
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: order_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Checkout dimulai, status PENDING
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/TransactionDetail' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Order tidak dalam status DRAFT (ErrNotDraft)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /orders/{order_id}/checkout/confirm:
+    post:
+      tags: [Transaction]
+      summary: Konfirmasi checkout (PENDING -> CONFIRMED)
+      description: >
+        order.ConfirmCheckout (RequireOperator). Body wajib `payment_method`.
+        Server menolak kalau begin-checkout belum dipanggil (ErrCheckoutNotStarted)
+        atau gesture terlalu cepat <800ms sejak checkout_started_at (ErrGestureTooFast).
+        Stamp confirmed_at + confirmed_by (string), lalu trigger consumption_log
+        dari product.recipe. Response menyertakan qris_string saat payment QRIS_STATIC.
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: order_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [payment_method]
+              properties:
+                payment_method: { $ref: '#/components/schemas/PaymentMethod' }
+      responses:
+        '200':
+          description: Order CONFIRMED. data = Order + qris_string (nullable, hanya QRIS_STATIC).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    allOf:
+                      - $ref: '#/components/schemas/Transaction'
+                      - type: object
+                        properties:
+                          qris_string: { type: string, nullable: true, description: Diisi hanya saat payment_method = QRIS_STATIC }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Body invalid atau checkout belum dimulai (ErrCheckoutNotStarted)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Order tidak PENDING (ErrNotPending) atau konfirmasi terlalu cepat <800ms (ErrGestureTooFast)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /orders/{order_id}/void:
+    post:
+      tags: [Transaction]
+      summary: Void order (operator)
+      description: >
+        order.VoidOrder (RequireOperator). Tidak ada request body. Mengembalikan
+        response.NoContent = HTTP 200 dengan body {"success":true} (BUKAN 204).
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: order_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Order di-void. Body {"success":true} tanpa data.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+          x-klay-flag:
+            kind: suspected-bug
+            note: "response.NoContent() returns 200 with {success:true}, not 204 No Content (pkg/response/response.go). Endpoint takes no request body, so void_reason is NOT captured on the operator void path."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /transactions/{id}/void:
+    post:
+      tags: [Transaction]
+      summary: Void order (owner)
+      description: >
+        order.VoidOrderByOwner (RequireOwner). Write mutation di domain order tapi
+        di-mount di path /transactions/{id}/void. Body wajib `void_reason`.
+        Owner identity diambil dari user_id JWT. Mengembalikan response.NoContent =
+        HTTP 200 dengan {"success":true} (BUKAN 204).
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [void_reason]
+              properties:
+                void_reason: { type: string, minLength: 1, maxLength: 500, description: Wajib diisi untuk audit }
+      responses:
+        '200':
+          description: Order di-void. Body {"success":true} tanpa data.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+          x-klay-flag:
+            kind: suspected-bug
+            note: "response.NoContent() returns 200 with {success:true}, not 204 (pkg/response/response.go). Path lives under /transactions but the handler is order.VoidOrderByOwner."
+        '400': { description: void_reason kosong / body invalid, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /transactions:
+    get:
+      tags: [Transaction]
+      summary: List transaksi business (read-only log)
+      description: >
+        transaction.List (RequireOwner). Read-only history. status query menerima
+        hanya DRAFT/CONFIRMED/VOIDED — PENDING ditolak 400 oleh validasi list-filter.
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: start_date, in: query, schema: { type: string, format: date }, description: Format YYYY-MM-DD }
+        - { name: end_date, in: query, schema: { type: string, format: date }, description: Format YYYY-MM-DD }
+        - name: status
+          in: query
+          description: "Hanya DRAFT, CONFIRMED, VOIDED diterima. PENDING ditolak 400."
+          schema: { type: string, enum: [DRAFT, CONFIRMED, VOIDED] }
+        - { name: payment_method, in: query, schema: { $ref: '#/components/schemas/PaymentMethod' } }
+        - { name: operator_id, in: query, schema: { type: string, format: uuid } }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100 } }
+      responses:
+        '200':
+          description: List transaksi berpaginasi
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      transactions:
+                        type: array
+                        items: { $ref: '#/components/schemas/Transaction' }
+                      pagination: { $ref: '#/components/schemas/Pagination' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Filter invalid (mis. status=PENDING, payment_method/tanggal/page/limit salah)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /transactions/{transaction_id}:
+    get:
+      tags: [Transaction]
+      summary: Detail transaksi
+      description: >
+        transaction.GetByID (RequireOperator). Mengembalikan OrderWithItems
+        (Transaction + items[]).
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: transaction_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Detail transaksi
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/TransactionDetail' }
+                  error: { type: string, nullable: true }
+        '400': { description: transaction_id tidak valid, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /operator/transactions:
+    get:
+      tags: [Transaction]
+      summary: List transaksi milik operator yang login
+      description: >
+        transaction.OperatorList (RequireOperatorOnly). Operator-scoped — hanya
+        transaksi operator dari JWT. Filter: start_date, end_date, page, limit
+        (tidak ada filter status/payment_method/operator_id di endpoint ini).
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: start_date, in: query, schema: { type: string, format: date }, description: Format YYYY-MM-DD }
+        - { name: end_date, in: query, schema: { type: string, format: date }, description: Format YYYY-MM-DD }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100 } }
+      responses:
+        '200':
+          description: List transaksi operator berpaginasi
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      transactions:
+                        type: array
+                        items: { $ref: '#/components/schemas/Transaction' }
+                      pagination: { $ref: '#/components/schemas/Pagination' }
+                  error: { type: string, nullable: true }
+        '400': { description: Filter invalid, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ==========================================================
+  # METRICS (OWNER ANALYTICS — SUMMARY, REPORTS, INSIGHT)
+  # ==========================================================
+
+  /metrics/summary:
+    get:
+      tags: [Metrics]
+      summary: Ringkasan performa business
+      description: Aggregate untuk dashboard. Count hanya status CONFIRMED.
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: period
+          in: query
+          schema: { type: string, enum: [today, this_week, this_month, last_month], default: this_month }
+      responses:
+        '200':
+          description: Summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/DashboardSummary' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /metrics/trend:
+    get:
+      tags: [Metrics]
+      summary: Tren transaksi harian
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: start_date, in: query, schema: { type: string, format: date } }
+        - { name: end_date, in: query, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: Tren harian
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/DailyTrend' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /metrics/top-products:
+    get:
+      tags: [Metrics]
+      summary: Produk terlaris
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: period
+          in: query
+          schema: { type: string, enum: [today, this_week, this_month, last_month], default: this_month }
+        - { name: limit, in: query, schema: { type: integer, default: 10, maximum: 50 } }
+      responses:
+        '200':
+          description: Top produk
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/TopProduct' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /metrics/peak-hours:
+    get:
+      tags: [Metrics]
+      summary: Distribusi jam tersibuk
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: period
+          in: query
+          schema: { type: string, enum: [this_week, this_month, last_month], default: this_month }
+      responses:
+        '200':
+          description: Peak hours
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/HourlyDistribution' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /metrics/overview:
+    get:
+      tags: [Metrics]
+      summary: Analytics overview untuk custom date range
+      description: Dipakai di page Analytics, mendukung custom timeframe dan period comparison.
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: start_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: end_date, in: query, required: true, schema: { type: string, format: date } }
+        - name: compare_with
+          in: query
+          schema: { type: string, enum: [previous_period, previous_year, none], default: previous_period }
+      responses:
+        '200':
+          description: Analytics overview
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/AnalyticsOverview' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /metrics/reports/daily-sales:
+    get:
+      tags: [Metrics]
+      summary: Laporan penjualan harian
+      description: Aggregate transaksi CONFIRMED per hari pada tanggal tertentu.
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: date, in: query, required: true, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: Laporan harian
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/DailySalesReport' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /metrics/reports/monthly-sales:
+    get:
+      tags: [Metrics]
+      summary: Laporan penjualan bulanan
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: month, in: query, required: true, schema: { type: string, pattern: '^\\d{4}-\\d{2}$' }, description: Format YYYY-MM }
+      responses:
+        '200':
+          description: Laporan bulanan
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/MonthlySalesReport' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /metrics/reports/consumption:
+    get:
+      tags: [Metrics]
+      summary: Laporan pemakaian bahan baku
+      description: >
+        Aggregate dari consumption_log per ingredient untuk periode.
+        Foundation buat owner restock decision dan AI insight downstream.
+      x-klay-flag:
+        kind: not-implemented
+        note: "Returns empty entries[]; consumption_log not implemented (handler_report.go). ingredient query param is ignored."
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: start_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: end_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: ingredient, in: query, schema: { type: string }, description: Filter per ingredient name (diabaikan server) }
+      responses:
+        '200':
+          description: Laporan consumption
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/ConsumptionReport' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /metrics/reports/export:
+    post:
+      tags: [Metrics]
+      summary: Export laporan ke PDF atau CSV
+      description: >
+        Generate file download. Server return URL temporary atau stream langsung.
+        Type laporan dan periode di-passing via body.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, format, period]
+              properties:
+                type:
+                  type: string
+                  enum: [daily_sales, monthly_sales, consumption]
+                format:
+                  type: string
+                  enum: [pdf, csv]
+                period:
+                  type: object
+                  description: Shape tergantung type. Daily=date, monthly=month, consumption=start_date+end_date.
+                  additionalProperties: true
+      responses:
+        '200':
+          description: File generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      download_url: { type: string, format: uri }
+                      expires_at: { type: string, format: date-time }
+                      filename: { type: string }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422':
+          description: Type / format / period combination tidak valid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /metrics/insight:
+    get:
+      tags: [Metrics]
+      summary: List insight cards
+      description: >
+        Rule-based MVP. Schema sudah siap untuk model_version + confidence
+        kalau nanti switch ke AI engine.
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Insight cards
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/InsightCard' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ==========================================================
+  # ADMIN (SKALAR STAFF)
+  # ==========================================================
+  # Surface terpisah dari owner/operator.
+  # Auth: X-Admin-Key header (shared secret, bukan JWT). Lihat AdminKeyAuth scheme.
+  # ==========================================================
+
+  /admin/auth/login:
+    post:
+      tags: [Admin]
+      summary: Admin Skalar login
+      x-klay-flag:
+        kind: not-implemented
+        note: "Route absent from admin/routes.go; admin uses X-Admin-Key header, no JWT login flow."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: Admin login berhasil
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      access_token: { type: string }
+                      admin: { $ref: '#/components/schemas/AdminUser' }
+                  error: { type: string, nullable: true }
+        '401':
+          description: Credential salah
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /admin/auth/refresh:
+    post:
+      tags: [Admin]
+      summary: Refresh admin access token
+      x-klay-flag:
+        kind: not-implemented
+        note: "Route absent from admin/routes.go; admin uses X-Admin-Key header, no JWT login flow."
+      responses:
+        '200':
+          description: Token baru
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      access_token: { type: string }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /admin/auth/logout:
+    post:
+      tags: [Admin]
+      summary: Admin logout
+      x-klay-flag:
+        kind: not-implemented
+        note: "Route absent from admin/routes.go; admin uses X-Admin-Key header, no JWT login flow."
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Logout berhasil
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /admin/me:
+    get:
+      tags: [Admin]
+      summary: Profil admin yang sedang login
+      x-klay-flag:
+        kind: not-implemented
+        note: "Route absent from admin/routes.go; admin uses X-Admin-Key header, no JWT login flow."
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Profil admin
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/AdminUser' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---- Admin: Business management ----
+
+  /admin/owners:
+    get:
+      tags: [Admin]
+      summary: List semua owners (cross-merchant)
+      description: >
+        Admin view. handler.ListOwners — hanya menerima page dan limit.
+        Filter status/plan/q tidak diproses server (admin/handler.go).
+      security: [{ AdminKeyAuth: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1, minimum: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        '200':
+          description: List owners berpaginasi
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/OwnerListResult' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+    post:
+      tags: [Admin]
+      summary: Onboard merchant baru
+      description: >
+        Create Business + User owner sekaligus. Body matches admin/model.go
+        CreateBusinessRequest. business_id digenerate server.
+      security: [{ AdminKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateBusinessRequest' }
+      responses:
+        '201':
+          description: Owner berhasil di-onboard
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/OwnerDetail' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Input tidak valid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Email owner sudah dipakai
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /admin/owners/{owner_id}:
+    parameters:
+      - { name: owner_id, in: path, required: true, schema: { type: string, format: uuid } }
+
+    get:
+      tags: [Admin]
+      summary: Detail owner
+      security: [{ AdminKeyAuth: [] }]
+      responses:
+        '200':
+          description: Detail owner
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/OwnerDetail' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+    patch:
+      tags: [Admin]
+      summary: Update business info owner (admin-controlled fields)
+      description: >
+        Matches admin/model.go UpdateBusinessRequest. Field yang tidak dikirim tidak berubah.
+        merchant_status enum: PENDING | REGISTERED | ACTIVE | SUSPENDED.
+      security: [{ AdminKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateBusinessRequest' }
+      responses:
+        '200':
+          description: Owner ter-update
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/OwnerDetail' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/owners/{owner_id}/status:
+    patch:
+      tags: [Admin]
+      summary: Toggle aktif/suspend owner
+      description: >
+        handler.SetOwnerStatus — boolean toggle. enabled=true mengaktifkan,
+        enabled=false mensuspend. Returns HTTP 200 { success: true } via response.NoContent().
+      security: [{ AdminKeyAuth: [] }]
+      parameters:
+        - { name: owner_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+                  description: "true = aktifkan, false = suspend"
+      responses:
+        '200':
+          description: Status ter-toggle. response.NoContent() returns HTTP 200 { success:true }.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/owners/{owner_id}/credential:
+    post:
+      tags: [Admin]
+      summary: Set credential login owner (email dan/atau password)
+      description: >
+        handler.SetOwnerCredential. email opsional (jika dikirim harus valid email).
+        password wajib, min 6 karakter. Returns HTTP 200 { success:true } via response.NoContent().
+      security: [{ AdminKeyAuth: [] }]
+      x-klay-flag:
+        kind: undocumented
+        note: "Route present in admin/routes.go but absent from prior contract."
+      parameters:
+        - { name: owner_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  nullable: true
+                  description: Opsional. Jika dikirim harus valid email format.
+                password:
+                  type: string
+                  format: password
+                  minLength: 6
+                  description: Wajib, min 6 karakter.
+      responses:
+        '200':
+          description: Credential diperbarui. response.NoContent() returns HTTP 200 { success:true }.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---- Admin: Product management (CRUD penuh per business) ----
+
+  /admin/owners/{owner_id}/products:
+    parameters:
+      - { name: owner_id, in: path, required: true, schema: { type: string, format: uuid } }
+
+    get:
+      tags: [Admin]
+      summary: List produk milik business
+      description: >
+        handler.ListOwnerProducts. Response membungkus products di dalam object
+        { products: [...] } (bukan array langsung).
+      security: [{ AdminKeyAuth: [] }]
+      responses:
+        '200':
+          description: List produk
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      products:
+                        type: array
+                        items: { $ref: '#/components/schemas/AdminProduct' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+    post:
+      tags: [Admin]
+      summary: Tambah produk untuk business
+      description: >
+        handler.CreateProduct. Body matches admin/model.go AdminCreateProductRequest.
+        business_id diambil dari path param, bukan body.
+      security: [{ AdminKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminCreateProductRequest' }
+      responses:
+        '201':
+          description: Produk dibuat
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/AdminProduct' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Input tidak valid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/products/{product_id}:
+    parameters:
+      - { name: product_id, in: path, required: true, schema: { type: string, format: uuid } }
+
+    get:
+      tags: [Admin]
+      summary: Detail produk (termasuk recipe)
+      description: handler.GetProduct. Returns AdminProductDetail yang menyertakan recipe array.
+      security: [{ AdminKeyAuth: [] }]
+      responses:
+        '200':
+          description: Detail produk dengan recipe
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/AdminProductDetail' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+    patch:
+      tags: [Admin]
+      summary: Update produk (partial)
+      description: >
+        handler.UpdateProduct. Body matches admin/model.go AdminUpdateProductRequest.
+        Semua field optional (pointer) — field tidak dikirim tidak berubah.
+      security: [{ AdminKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminUpdateProductRequest' }
+      responses:
+        '200':
+          description: Produk ter-update
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/AdminProduct' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+    delete:
+      tags: [Admin]
+      summary: Hapus produk
+      description: >
+        handler.DeleteProduct. Soft delete kalau produk sudah ada di transaksi historis.
+        Returns HTTP 200 { success:true } via response.NoContent() (BUKAN 204).
+      security: [{ AdminKeyAuth: [] }]
+      responses:
+        '200':
+          description: Produk dihapus
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/products/{product_id}/recipe:
+    put:
+      tags: [Admin]
+      summary: Replace recipe produk
+      description: >
+        handler.UpdateProductRecipe. Mengganti seluruh recipe array (bukan merge).
+        Returns HTTP 200 { success:true } via response.NoContent() (BUKAN 204).
+      security: [{ AdminKeyAuth: [] }]
+      parameters:
+        - { name: product_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recipe]
+              properties:
+                recipe:
+                  type: array
+                  items: { $ref: '#/components/schemas/Ingredient' }
+                  description: Array ingredient baru. Mengganti seluruh recipe yang ada.
+      responses:
+        '200':
+          description: Recipe ter-update. response.NoContent() returns HTTP 200 { success:true }.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---- Admin: Operator removal (on request) ----
+
+  /admin/owners/{owner_id}/operators/{operator_id}:
+    delete:
+      tags: [Admin]
+      summary: Hapus operator atas permintaan merchant
+      description: >
+        handler.DeleteOperator. Admin hanya bisa REMOVE operator on request.
+        Tidak ada request body — handler tidak membaca body (admin/handler.go).
+        Returns HTTP 200 { success:true } via response.NoContent() (BUKAN 204).
+      security: [{ AdminKeyAuth: [] }]
+      parameters:
+        - { name: owner_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: operator_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Operator dihapus. response.NoContent() returns HTTP 200 { success:true }.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---- Admin: Transaction cross-merchant view + void ----
+
+  /admin/transactions:
+    get:
+      tags: [Admin]
+      summary: List transaksi cross-merchant
+      description: >
+        handler.ListTransactions. Filter yang diproses: status (string), business_id (uuid),
+        start_date (YYYY-MM-DD, filter created_at >= start), end_date (YYYY-MM-DD, filter created_at < end+1day),
+        page (default 1), limit (default 20, max 100).
+      security: [{ AdminKeyAuth: [] }]
+      parameters:
+        - { name: status, in: query, schema: { type: string }, description: "Filter status transaksi (string bebas, tidak divalidasi enum di handler)." }
+        - { name: business_id, in: query, schema: { type: string, format: uuid }, description: Filter per business. }
+        - { name: start_date, in: query, schema: { type: string, format: date }, description: "Format YYYY-MM-DD. created_at >= start_date." }
+        - { name: end_date, in: query, schema: { type: string, format: date }, description: "Format YYYY-MM-DD. created_at < end_date + 1 hari." }
+        - { name: page, in: query, schema: { type: integer, default: 1, minimum: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        '200':
+          description: List transaksi cross-merchant berpaginasi
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/AdminListTransactionsResult' }
+                  error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/transactions/{transaction_id}/void:
+    post:
+      tags: [Admin]
+      summary: Void transaksi (admin)
+      description: >
+        handler.VoidTransaction. Tidak ada request body — handler tidak membaca body.
+        Returns HTTP 200 { success:true } via response.NoContent() (BUKAN 204).
+        409 dikembalikan jika transaksi bukan status PENDING/CONFIRMED (tidak bisa di-void).
+      security: [{ AdminKeyAuth: [] }]
+      parameters:
+        - { name: transaction_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Transaksi di-void. response.NoContent() returns HTTP 200 { success:true }.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Transaksi tidak bisa di-void (sudah VOIDED atau status tidak valid)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+# ============================================================
+# COMPONENTS
+# ============================================================
+
+components:
+  # x-klay-flag (vendor extension, may appear on any operation or schema):
+  #   x-klay-flag:
+  #     kind: suspected-bug | not-implemented | undocumented
+  #     note: "<short human explanation>"
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    AdminKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: Shared secret untuk service-to-service auth dari klay-admin panel
+
+  schemas:
+
+    # ---- Auth ----
+
+    AuthSuccess:
+      type: object
+      properties:
+        success: { type: boolean }
+        data:
+          type: object
+          properties:
+            access_token: { type: string }
+        error: { type: string, nullable: true }
+
+    # ---- User (owner) ----
+
+    UserWithBusiness:
+      type: object
+      properties:
+        id: { type: string }
+        full_name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string, nullable: true }
+        role: { type: string, description: Diisi dari token (mis. owner). }
+        business: { $ref: '#/components/schemas/Business' }
+
+    # ---- Admin user ----
+
+    AdminUser:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string, format: email }
+        role: { type: string, enum: [admin, super_admin] }
+        created_at: { type: string, format: date-time }
+
+    # ---- Business ----
+
+    PlanEnum:
+      type: string
+      enum: [normal, enterprise, white_label, max]
+      description: >
+        normal = subs default. enterprise = larger model + custom config.
+        white_label = custom branding. max = semua fitur unlocked + UI treatment khusus.
+
+    BusinessStatus:
+      type: string
+      enum: [ACTIVE, SUSPENDED, CHURNED]
+
+    Business:
+      type: object
+      description: >
+        Bentuk Business yang dikembalikan handler /business (user domain).
+        Field set diverifikasi terhadap businessResponse di user/model.go.
+      properties:
+        id: { type: string, format: uuid }
+        klay_id: { type: string, description: Identifier merchant (KL-...). }
+        business_name: { type: string }
+        phone: { type: string, nullable: true }
+        address: { type: string, nullable: true }
+        city: { type: string, nullable: true }
+        country: { type: string, nullable: true }
+        xendit_status: { type: string, description: Status onboarding/akun Xendit merchant. }
+        qris_string:
+          type: string
+          nullable: true
+          description: QRIS static payload milik merchant. Single per business.
+        category: { type: string, nullable: true }
+
+    BusinessLite:
+      type: object
+      description: Bentuk ringkas Business yang dikirim ke PWA operator (operator gak butuh tau plan/features detail).
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        category: { type: string }
+        qris_static_payload: { type: string, nullable: true }
+
+    BusinessAdminView:
+      allOf:
+        - $ref: '#/components/schemas/Business'
+        - type: object
+          description: >
+            Admin-scoped business view. Admin-only fields (plan, status,
+            quota, lifecycle timestamps) live here, not on the owner-facing
+            Business schema. Reconciled separately in the Admin domain task.
+          properties:
+            owner_name: { type: string, description: Snapshot dari User saat onboarding. }
+            owner_id: { type: string, format: uuid, description: Relasi ke User }
+            plan: { $ref: '#/components/schemas/PlanEnum' }
+            features:
+              type: array
+              items: { type: string }
+              description: Feature flags. Placeholder MVP.
+            max_operators: { type: integer, description: -1 = unlimited }
+            is_premium_user: { type: boolean }
+            status: { $ref: '#/components/schemas/BusinessStatus' }
+            onboarded_at: { type: string, format: date-time, nullable: true }
+            suspended_at: { type: string, format: date-time, nullable: true }
+            churned_at: { type: string, format: date-time, nullable: true }
+            last_active_at: { type: string, format: date-time, nullable: true }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+            onboarded_by: { type: string, format: uuid, nullable: true, description: Admin yang onboard, audit }
+            onboard_notes: { type: string, nullable: true, description: Catatan deal-deal-an offline-first }
+
+    # ---- Operator ----
+
+    Operator:
+      type: object
+      description: Bentuk operator aman dikirim ke client. Tidak include password_hash atau qr_token.
+      properties:
+        id: { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        name: { type: string }
+        operator_code: { type: string, description: Server-generated (KL-XXXXX), unik per-business }
+        is_active: { type: boolean }
+        has_active_session: { type: boolean, description: Computed; true bila ada refresh token valid. }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    OperatorWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/Operator'
+        - type: object
+          properties:
+            qr_token:
+              type: string
+              description: Token statis url-safe base64. Hanya dikembalikan saat create, rotate, dan regenerate.
+            pin:
+              type: string
+              description: PIN 6 digit. Hanya dikembalikan satu kali (one-time) saat create/rotate/regenerate.
+
+    OperatorLoginResponse:
+      type: object
+      properties:
+        access_token: { type: string, description: JWT scope=operator dengan claim operator_id + business_id }
+        operator: { $ref: '#/components/schemas/Operator' }
+        business: { $ref: '#/components/schemas/BusinessLite' }
+
+    # ---- Product ----
+
+    RecipeIngredient:
+      type: object
+      description: Satu bahan dalam recipe produk. Structured biar mesin bisa aggregate untuk consumption_log.
+      x-klay-flag:
+        kind: suspected-bug
+        note: "Schema tidak dipakai oleh product API. product/model.go Product TIDAK punya field recipe, dan CreateProductRequest/UpdateProductRequest tidak menerima recipe. RecipeIngredient dipertahankan hanya sebagai referensi domain consumption-tracking; tidak ada endpoint product yang mengembalikan atau menerimanya."
+      required: [name, qty, unit]
+      properties:
+        name:
+          type: string
+          description: Identifier bahan, snake_case (gula_aren, susu_uht, kopi_bubuk)
+        qty:
+          type: number
+          description: Jumlah per 1 unit produk
+        unit:
+          type: string
+          enum: [ml, l, g, kg, pcs]
+          description: Satuan ukur
+
+    Product:
+      type: object
+      description: >
+        Representasi satu baris tabel products, direkonsiliasi ke product/model.go.
+        Tidak ada nested recipe — Product struct tidak punya field recipe.
+      x-klay-flag:
+        kind: suspected-bug
+        note: "Product has no recipe field in product/model.go; consumption tracking depends on a recipe the product API does not expose."
+      properties:
+        id: { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        name: { type: string }
+        price: { type: integer, format: int64, description: IDR integer, no decimal (int64) }
+        category: { type: string, nullable: true }
+        description: { type: string, nullable: true, description: Teks bebas, marketing copy }
+        is_available: { type: boolean, description: Operator hide produk yang lagi habis }
+        total_sold: { type: integer, description: Total unit CONFIRMED, untuk sort popular }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateProductRequest:
+      type: object
+      description: >
+        Body POST /products (product/model.go CreateProductRequest).
+        Tidak ada field recipe. business_id berasal dari JWT, bukan body.
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 255 }
+        price: { type: integer, format: int64, minimum: 0, description: IDR integer; default 0 kalau tidak dikirim }
+        category: { type: string, nullable: true, minLength: 1, maxLength: 100 }
+        description: { type: string, nullable: true, maxLength: 2000 }
+        is_available: { type: boolean, nullable: true, description: Pointer di Go; nil = pakai default service }
+
+    UpdateProductRequest:
+      type: object
+      description: >
+        Body PATCH /products/{product_id} (product/model.go UpdateProductRequest).
+        Semua field optional (pointer) — partial update. Tidak ada field recipe.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 255 }
+        price: { type: integer, format: int64, minimum: 0 }
+        category: { type: string, nullable: true, minLength: 1, maxLength: 100 }
+        description: { type: string, nullable: true, maxLength: 2000 }
+        is_available: { type: boolean, nullable: true }
+
+    ProductInput:
+      type: object
+      description: >
+        Legacy schema (sebelum reconciliation). Dipertahankan untuk referensi.
+        Gunakan AdminCreateProductRequest / AdminUpdateProductRequest untuk admin endpoints.
+      required: [name, price]
+      properties:
+        name: { type: string }
+        price: { type: integer }
+        category: { type: string, nullable: true }
+        description: { type: string, nullable: true }
+        recipe:
+          type: array
+          items: { $ref: '#/components/schemas/RecipeIngredient' }
+        is_available: { type: boolean, default: true }
+
+    # ---- Admin Owner schemas ----
+
+    CreateBusinessRequest:
+      type: object
+      description: Body POST /admin/owners. Matches admin/model.go CreateBusinessRequest.
+      required: [email, password, full_name, business_name]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password, minLength: 6 }
+        full_name: { type: string, minLength: 1, maxLength: 255 }
+        business_name: { type: string, minLength: 1, maxLength: 255 }
+        phone: { type: string, nullable: true, maxLength: 32 }
+        address: { type: string, nullable: true }
+        city: { type: string, nullable: true, maxLength: 100 }
+        country: { type: string, nullable: true, maxLength: 100 }
+
+    UpdateBusinessRequest:
+      type: object
+      description: Body PATCH /admin/owners/{owner_id}. Matches admin/model.go UpdateBusinessRequest. Semua field optional.
+      properties:
+        business_name: { type: string, nullable: true, minLength: 1, maxLength: 255 }
+        phone: { type: string, nullable: true, maxLength: 32 }
+        address: { type: string, nullable: true }
+        city: { type: string, nullable: true, maxLength: 100 }
+        country: { type: string, nullable: true, maxLength: 100 }
+        merchant_status:
+          type: string
+          nullable: true
+          enum: [PENDING, REGISTERED, ACTIVE, SUSPENDED]
+          description: Status merchant lifecycle.
+
+    OwnerSummary:
+      type: object
+      description: Satu baris di list owners. Matches admin/model.go OwnerSummary.
+      properties:
+        business_id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        klay_id: { type: string, description: "Identifier merchant (KL-...)" }
+        email: { type: string, format: email }
+        full_name: { type: string }
+        business_name: { type: string }
+        merchant_status: { type: string }
+        is_active: { type: boolean }
+        is_suspended: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    OwnerDetail:
+      type: object
+      description: Detail owner termasuk field kontak. Matches admin/model.go OwnerDetail.
+      properties:
+        business_id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        klay_id: { type: string }
+        email: { type: string, format: email }
+        full_name: { type: string }
+        business_name: { type: string }
+        phone: { type: string, nullable: true }
+        address: { type: string, nullable: true }
+        city: { type: string, nullable: true }
+        country: { type: string, nullable: true }
+        qris_string: { type: string, nullable: true }
+        merchant_status: { type: string }
+        is_active: { type: boolean }
+        is_suspended: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    OwnerListResult:
+      type: object
+      description: Response GET /admin/owners. Matches admin/model.go OwnerListResult.
+      properties:
+        owners:
+          type: array
+          items: { $ref: '#/components/schemas/OwnerSummary' }
+        total: { type: integer }
+        page: { type: integer }
+        limit: { type: integer }
+
+    # ---- Admin Product schemas ----
+
+    Ingredient:
+      type: object
+      description: Satu bahan dalam recipe produk. Matches admin/model.go Ingredient.
+      required: [name, qty, unit]
+      properties:
+        name: { type: string, description: Nama bahan }
+        qty: { type: number, format: float, description: Jumlah per 1 unit produk }
+        unit: { type: string, description: "Satuan ukur (ml, l, g, kg, pcs, dll)" }
+
+    AdminProduct:
+      type: object
+      description: >
+        Produk admin tanpa recipe. Matches admin/model.go AdminProduct.
+        recipe TIDAK ada di list item — hanya tersedia di AdminProductDetail (GET single).
+      properties:
+        id: { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        name: { type: string }
+        price: { type: integer, format: int64, description: IDR integer }
+        category: { type: string, nullable: true }
+        description: { type: string, nullable: true }
+        is_available: { type: boolean }
+        total_sold: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AdminProductDetail:
+      allOf:
+        - $ref: '#/components/schemas/AdminProduct'
+        - type: object
+          description: AdminProduct + recipe array. Matches admin/model.go AdminProductDetail.
+          properties:
+            recipe:
+              type: array
+              items: { $ref: '#/components/schemas/Ingredient' }
+              description: Daftar ingredient. Array kosong jika recipe belum diset.
+
+    AdminCreateProductRequest:
+      type: object
+      description: Body POST /admin/owners/{owner_id}/products. Matches admin/model.go AdminCreateProductRequest.
+      required: [name]
+      properties:
+        name: { type: string }
+        price: { type: integer, format: int64, minimum: 0, description: IDR integer; default 0 }
+        category: { type: string, nullable: true }
+        description: { type: string, nullable: true }
+        is_available: { type: boolean, nullable: true, description: Pointer di Go; nil = server default }
+
+    AdminUpdateProductRequest:
+      type: object
+      description: Body PATCH /admin/products/{product_id}. Matches admin/model.go AdminUpdateProductRequest. Semua field optional.
+      properties:
+        name: { type: string, nullable: true }
+        price: { type: integer, format: int64, minimum: 0, nullable: true }
+        category: { type: string, nullable: true }
+        description: { type: string, nullable: true }
+        is_available: { type: boolean, nullable: true }
+
+    # ---- Admin Transaction schemas ----
+
+    AdminTransaction:
+      type: object
+      description: Satu transaksi di view admin. Matches admin/model.go AdminTransaction.
+      properties:
+        id: { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        operator_id: { type: string, format: uuid, nullable: true }
+        order_id: { type: string, description: "Format KLAY-YYYYMMDD-xxxx" }
+        total_amount: { type: integer, format: int64, description: IDR integer }
+        payment_method: { type: string, nullable: true, description: Null sebelum CONFIRMED }
+        status: { type: string, description: DRAFT | PENDING | CONFIRMED | VOIDED }
+        note: { type: string, nullable: true }
+        paid_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AdminListTransactionsResult:
+      type: object
+      description: Response GET /admin/transactions. Matches admin/model.go AdminListTransactionsResult.
+      properties:
+        transactions:
+          type: array
+          items: { $ref: '#/components/schemas/AdminTransaction' }
+        total: { type: integer }
+        page: { type: integer }
+        limit: { type: integer }
+
+    # ---- Transaction ----
+
+    TransactionStatus:
+      type: string
+      enum: [DRAFT, CONFIRMED, VOIDED]
+      description: >
+        DRAFT = order sedang diisi operator (default saat create).
+        CONFIRMED = pembayaran dikonfirmasi.
+        VOIDED = dibatalkan.
+        Catatan: PENDING ADA sebagai state internal order (DRAFT -> PENDING ->
+        CONFIRMED via begin/confirm checkout), tetapi DITOLAK oleh validasi filter
+        list transaksi (transaction/handler.go), jadi enum filter ini tidak memuatnya.
+      x-klay-flag:
+        kind: suspected-bug
+        note: "Code rejects PENDING (transaction/handler.go list-filter validation). Prior contract listed PENDING as a state. PENDING masih valid sebagai status order tersimpan, hanya tidak bisa dipakai sebagai nilai filter list."
+
+    PaymentMethod:
+      type: string
+      enum: [CASH, QRIS_STATIC, TRANSFER]
+      description: >
+        CASH = tunai. QRIS_STATIC = pembayaran via QRIS merchant static
+        (operator konfirmasi manual). TRANSFER = transfer rekening (operator cek manual).
+        Dynamic QRIS via gateway = roadmap post-MVP.
+
+    Transaction:
+      type: object
+      description: >
+        Field-set direkonsiliasi ke order/model.go + transaction/model.go.
+        Mewakili satu baris orders. operator_name + item_count hanya di-set oleh
+        endpoint List (computed, bukan kolom langsung).
+      properties:
+        id: { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        operator_id: { type: string, format: uuid, nullable: true, description: Operator yang bikin order; null kalau owner langsung. (Sebelumnya salah dinamai created_by_operator_id.) }
+        order_id: { type: string, description: Format KLAY-YYYYMMDD-xxxx, ditampilkan ke operator/owner }
+        total_amount: { type: integer, description: Sum dari items.subtotal, IDR integer }
+        payment_method: { allOf: [{ $ref: '#/components/schemas/PaymentMethod' }], nullable: true, description: Null sebelum confirm, di-set saat CONFIRMED }
+        status: { $ref: '#/components/schemas/TransactionStatus' }
+        note: { type: string, nullable: true }
+        checkout_started_at: { type: string, format: date-time, nullable: true, description: Di-stamp saat begin-checkout (hanya ada di order/model.go, bukan transaction/model.go) }
+        confirmed_at: { type: string, format: date-time, nullable: true }
+        confirmed_by:
+          type: string
+          nullable: true
+          description: Siapa yang konfirmasi (string bebas). Null sebelum confirm.
+          x-klay-flag:
+            kind: suspected-bug
+            note: "confirmed_by is a bare string in order/model.go; prior contract modelled it as {type,id}. Auditor identity is not structured."
+        voided_at: { type: string, format: date-time, nullable: true }
+        void_reason: { type: string, nullable: true, description: "Diisi pada owner void. Operator void (POST /orders/:id/void) tidak menerima body sehingga tidak mengisi field ini." }
+        operator_name: { type: string, nullable: true, description: Computed; di-set hanya oleh GET /transactions List. }
+        item_count: { type: integer, description: Computed; di-set hanya oleh GET /transactions List. }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      # NOTE: voided_by DIHAPUS — tidak ada di order/model.go maupun transaction/model.go.
+      # Identitas pem-void tidak dipersist sebagai kolom; hanya voided_at + void_reason yang tersimpan.
+
+    TransactionDetail:
+      allOf:
+        - $ref: '#/components/schemas/Transaction'
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/TransactionItem' }
+
+    TransactionItem:
+      type: object
+      description: Snapshot field. product_name dan unit_price di-freeze saat order dibuat agar histori akurat walau produk di-edit/delete kemudian.
+      properties:
+        id: { type: string, format: uuid, description: ID baris order_items }
+        product_id: { type: string, format: uuid, nullable: true, description: Null kalau produk sumber sudah dihapus }
+        product_name: { type: string, description: Snapshot saat transaksi dibuat }
+        unit_price: { type: integer, description: Snapshot harga satuan saat transaksi dibuat, IDR integer }
+        quantity: { type: integer }
+        subtotal: { type: integer, description: unit_price * quantity }
+
+    # ---- Dashboard ----
+
+    DashboardSummary:
+      type: object
+      properties:
+        period: { type: string }
+        total_revenue: { type: integer, description: Sum total_amount status CONFIRMED }
+        total_transactions: { type: integer, description: Count status CONFIRMED }
+        total_pending: { type: integer, description: Count status PENDING saat ini }
+        total_voided: { type: integer, description: Count status VOIDED }
+        avg_transaction_value: { type: integer }
+        revenue_change_pct: { type: number, format: float, description: vs periode sebelumnya }
+        transaction_change_pct: { type: number, format: float }
+
+    DailyTrend:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        total_transactions: { type: integer }
+        total_revenue: { type: integer }
+
+    TopProduct:
+      type: object
+      properties:
+        product_id: { type: string }
+        product_name: { type: string }
+        total_sold: { type: integer }
+        total_revenue: { type: integer }
+        category: { type: string, nullable: true }
+
+    HourlyDistribution:
+      type: object
+      properties:
+        hour: { type: integer, description: 0-23 }
+        total_transactions: { type: integer }
+        avg_transactions: { type: number, format: float }
+
+    # ---- Analytics ----
+
+    AnalyticsOverview:
+      type: object
+      properties:
+        current_period:
+          type: object
+          properties:
+            start_date: { type: string, format: date }
+            end_date: { type: string, format: date }
+            total_revenue: { type: integer }
+            total_transactions: { type: integer }
+            avg_transaction_value: { type: integer }
+            daily_breakdown:
+              type: array
+              items: { $ref: '#/components/schemas/DailyTrend' }
+        comparison:
+          type: object
+          nullable: true
+          description: Null kalau compare_with == none
+          properties:
+            start_date: { type: string, format: date }
+            end_date: { type: string, format: date }
+            total_revenue: { type: integer }
+            total_transactions: { type: integer }
+            revenue_change_pct: { type: number, format: float }
+            transaction_change_pct: { type: number, format: float }
+
+    # ---- Report ----
+
+    DailySalesReport:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        business_id: { type: string, format: uuid }
+        total_revenue: { type: integer }
+        total_transactions: { type: integer }
+        breakdown_by_method:
+          type: array
+          items:
+            type: object
+            properties:
+              method: { $ref: '#/components/schemas/PaymentMethod' }
+              count: { type: integer }
+              revenue: { type: integer }
+        breakdown_by_product:
+          type: array
+          items: { $ref: '#/components/schemas/TopProduct' }
+
+    MonthlySalesReport:
+      type: object
+      properties:
+        month: { type: string, description: Format YYYY-MM }
+        business_id: { type: string, format: uuid }
+        total_revenue: { type: integer }
+        total_transactions: { type: integer }
+        daily_breakdown:
+          type: array
+          items: { $ref: '#/components/schemas/DailyTrend' }
+        breakdown_by_method:
+          type: array
+          items:
+            type: object
+            properties:
+              method: { $ref: '#/components/schemas/PaymentMethod' }
+              count: { type: integer }
+              revenue: { type: integer }
+        breakdown_by_product:
+          type: array
+          items: { $ref: '#/components/schemas/TopProduct' }
+
+    ConsumptionEntry:
+      type: object
+      properties:
+        ingredient_name: { type: string }
+        total_qty: { type: number }
+        unit: { type: string }
+        used_in_products:
+          type: array
+          items:
+            type: object
+            properties:
+              product_id: { type: string }
+              product_name: { type: string }
+              qty_consumed: { type: number }
+
+    ConsumptionReport:
+      type: object
+      properties:
+        start_date: { type: string, format: date }
+        end_date: { type: string, format: date }
+        business_id: { type: string, format: uuid }
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/ConsumptionEntry' }
+
+    # ---- Insight ----
+
+    InsightCard:
+      type: object
+      properties:
+        id: { type: string }
+        type:
+          type: string
+          enum: [trend, warning, opportunity, consumption]
+          description: consumption type baru untuk insight dari resource usage
+        title: { type: string, description: Maks 10 kata }
+        narrative: { type: string, description: 1-2 kalimat natural }
+        source_data_window:
+          type: object
+          description: Periode data yang generate insight ini
+          properties:
+            start_date: { type: string, format: date }
+            end_date: { type: string, format: date }
+        model_version: { type: string, default: rule-v1, description: Forward-compat untuk AI engine post-MVP }
+        confidence_score: { type: number, format: float, nullable: true, description: Null di MVP rule-based, di-isi saat switch ke AI }
+        updated_at: { type: string, format: date-time }
+
+    # ---- Shared ----
+
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total_items: { type: integer }
+        total_pages: { type: integer }
+
+    Error:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        data: { type: string, nullable: true, example: null }
+        error: { type: string }
+
+    SimpleSuccess:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data: { type: string, nullable: true, example: null }
+        error: { type: string, nullable: true }
+
+  responses:
+    Unauthorized:
+      description: Access token tidak valid atau tidak ada
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    Forbidden:
+      description: Role tidak punya akses ke resource ini
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    NotFound:
+      description: Resource tidak ditemukan
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    BadRequest:
+      description: Input tidak valid
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
