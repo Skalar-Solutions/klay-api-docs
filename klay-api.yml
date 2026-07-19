@@ -1,6 +1,12 @@
 openapi: 3.0.3
 
 # ============================================================
+# KLAY-API CONTRACT v0.8 — TELEMETRY DISTRIBUTION (Phase 2)
+# Added: POST /telemetry/heartbeat (owner/operator session, ingest),
+# GET /admin/distribution (admin JWT, aggregate read). New core/telemetry
+# domain, new app_installs table (migration 020). No existing endpoint
+# changed.
+# ============================================================
 # KLAY-API CONTRACT v0.7 — SERVER FIXES APPLIED (2026-06-24)
 # Breaking changes: /kasir/auth/* → /operator/auth/*, /orders/sessions removed.
 # ============================================================
@@ -54,7 +60,7 @@ info:
     Klay is a business intelligence layer for SMBs with in-house
     transaction management. Three primary roles: owner (dashboard access),
     operator (operator PWA access), and admin (Skalar staff, admin panel access).
-  version: 0.7.0
+  version: 0.8.1
   contact:
     name: Klay Development Team
 
@@ -69,6 +75,34 @@ servers:
 # ============================================================
 
 paths:
+
+  # ==========================================================
+  # SYSTEM
+  # ==========================================================
+
+  /health:
+    get:
+      tags: [System]
+      summary: Server health status (for the monitoring card in the admin panel)
+      description: >
+        cmd/main.go. Public, no auth — deliberately lightweight (2s DB ping
+        timeout) so it's safe to poll every few seconds. Returns HTTP 200
+        when status=ok, HTTP 503 when status=degraded (mirrors the existing
+        /readyz convention). Redis isn't wired into the app yet (see
+        docs/redis-caching-plan.md) — checks.redis always reports
+        not_configured rather than opening a new connection just for this
+        endpoint.
+      responses:
+        '200':
+          description: Server healthy
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+        '503':
+          description: One or more dependencies down (e.g. database unreachable)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
 
   # ==========================================================
   # AUTH (OWNER)
@@ -1530,30 +1564,46 @@ paths:
   # ==========================================================
   # ADMIN (SKALAR STAFF)
   # ==========================================================
-  # Surface terpisah dari owner/operator.
-  # Auth: X-Admin-Key header (shared secret, bukan JWT). Lihat AdminKeyAuth scheme.
+  # Every /admin/owners, /admin/products, /admin/transactions route below
+  # (reads AND writes) requires BearerAuth (admin JWT, role=admin) — issued
+  # by POST /admin/auth/google after a server-side Google OAuth + whitelist
+  # check (core/adminauth). audit_logs.admin_email always has a real
+  # per-admin identity.
+  #
+  # No shared-secret API key: an earlier design gated reads with a static
+  # X-Admin-Key, sent from the klay-admin browser bundle — but Vite inlines
+  # VITE_* env vars at build time, so that key was extractable from the
+  # deployed JS and bypassed the whitelist entirely for reads. Removed.
   # ==========================================================
 
-  /admin/auth/login:
+  /admin/auth/google:
     post:
       tags: [Admin]
-      summary: Admin Skalar login
-      x-klay-flag:
-        kind: not-implemented
-        note: "Route absent from admin/routes.go; admin uses X-Admin-Key header, no JWT login flow."
+      summary: Admin Skalar login via Google OAuth
+      description: >
+        core/adminauth. Frontend gets a Google ID token (credential) from
+        Google Sign-In and posts it here. Server verifies the token against
+        Google (signature + audience == GOOGLE_CLIENT_ID), extracts the
+        verified email, and checks it against ADMIN_WHITELIST_EMAILS (env
+        var, comma-separated — no DB table, parsed once into an in-memory
+        set). No match -> 403, no token issued. Match -> admin JWT issued
+        (access_token in body, refresh token via httpOnly
+        "admin_refresh_token" cookie — separate cookie name from
+        owner/operator's "refresh_token" so sessions can't collide if both
+        panels share a browser/cookie domain). Logs admin.login to
+        audit_logs.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [email, password]
+              required: [credential]
               properties:
-                email: { type: string, format: email }
-                password: { type: string, format: password }
+                credential: { type: string, description: Google ID token from Google Sign-In. }
       responses:
         '200':
-          description: Admin login successful
+          description: Login successful
           headers:
             Set-Cookie:
               schema: { type: string }
@@ -1569,8 +1619,18 @@ paths:
                       access_token: { type: string }
                       admin: { $ref: '#/components/schemas/AdminUser' }
                   error: { type: string, nullable: true }
+        '400':
+          description: Empty credential or invalid request body
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401':
-          description: Credential salah
+          description: Invalid Google token (signature/audience/expiry verification failed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Email not in ADMIN_WHITELIST_EMAILS. No token issued.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1581,7 +1641,14 @@ paths:
       summary: Refresh admin access token
       x-klay-flag:
         kind: not-implemented
-        note: "Route absent from admin/routes.go; admin uses X-Admin-Key header, no JWT login flow."
+        note: >
+          Not built in phase 0 — out of the endpoint list phase-0.md asked
+          for (only google/me/logout). admin_refresh_tokens rows ARE stored
+          on login and deletable on logout, so the storage side is ready;
+          only the redemption endpoint is missing. Until this exists, admin
+          sessions expire with JWT_ACCESS_EXPIRY (15m default) and require
+          a fresh Google sign-in — no silent refresh. Backlog for a later
+          phase.
       responses:
         '200':
           description: New token
@@ -1602,25 +1669,30 @@ paths:
     post:
       tags: [Admin]
       summary: Admin logout
-      x-klay-flag:
-        kind: not-implemented
-        note: "Route absent from admin/routes.go; admin uses X-Admin-Key header, no JWT login flow."
-      security: [{ BearerAuth: [] }]
+      description: >
+        core/adminauth. Public — no Bearer required (same pattern as owner
+        /auth/logout): reads the admin_refresh_token cookie, best-effort
+        deletes it server-side, always clears the cookie. Idempotent —
+        calling it with no cookie still returns 200.
       responses:
         '200':
-          description: Logout successful
+          description: Logout successful (idempotent, also when there is no active session)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SimpleSuccess' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
 
-  /admin/me:
+  /admin/auth/me:
     get:
       tags: [Admin]
-      summary: Profile of the currently authenticated admin
-      x-klay-flag:
-        kind: not-implemented
-        note: "Route absent from admin/routes.go; admin uses X-Admin-Key header, no JWT login flow."
+      summary: Identity of the admin from the active session
+      description: >
+        core/adminauth. Used by the FE to check the session. Pure JWT-claims
+        read, no DB call — email and name both come from the
+        Google-verified token at login time and are embedded in the JWT
+        itself (there's no admin identity row to look up). Reflects
+        whatever Google returned at login, not live data — if an admin's
+        Google profile name changes, /me won't show it until they log in
+        again.
       security: [{ BearerAuth: [] }]
       responses:
         '200':
@@ -1634,6 +1706,7 @@ paths:
                   data: { $ref: '#/components/schemas/AdminUser' }
                   error: { type: string, nullable: true }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   # ---- Admin: Business management ----
 
@@ -1644,7 +1717,7 @@ paths:
       description: >
         Admin view. handler.ListOwners — accepts only page and limit.
         Status/plan/q filters are not processed by the server (admin/handler.go).
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       parameters:
         - { name: page, in: query, schema: { type: integer, default: 1, minimum: 1 } }
         - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 100 } }
@@ -1668,7 +1741,7 @@ paths:
       description: >
         Creates Business + User owner in one operation. Body matches admin/model.go
         CreateBusinessRequest. business_id is server-generated.
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       requestBody:
         required: true
         content:
@@ -1705,7 +1778,7 @@ paths:
     get:
       tags: [Admin]
       summary: Owner details
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       responses:
         '200':
           description: Owner details
@@ -1727,7 +1800,7 @@ paths:
       description: >
         Matches admin/model.go UpdateBusinessRequest. Fields not sent remain unchanged.
         merchant_status enum: PENDING | REGISTERED | ACTIVE | SUSPENDED.
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       requestBody:
         required: true
         content:
@@ -1755,7 +1828,7 @@ paths:
       description: >
         handler.SetOwnerStatus — boolean toggle. enabled=true activates,
         enabled=false suspends. Returns HTTP 200 { success: true } via response.NoContent().
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       parameters:
         - { name: owner_id, in: path, required: true, schema: { type: string, format: uuid } }
       requestBody:
@@ -1786,7 +1859,7 @@ paths:
       description: >
         handler.SetOwnerCredential. email is optional (must be valid format if provided).
         password is required, min 6 characters. Returns HTTP 200 { success:true } via response.NoContent().
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       x-klay-flag:
         kind: undocumented
         note: "Route present in admin/routes.go but absent from prior contract."
@@ -1832,7 +1905,7 @@ paths:
       description: >
         handler.ListOwnerProducts. Response wraps products inside an object
         { products: [...] } (not a direct array).
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       responses:
         '200':
           description: Product list
@@ -1859,7 +1932,7 @@ paths:
       description: >
         handler.CreateProduct. Body matches admin/model.go AdminCreateProductRequest.
         business_id is taken from the path param, not the body.
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       requestBody:
         required: true
         content:
@@ -1892,7 +1965,7 @@ paths:
       tags: [Admin]
       summary: Product details (including recipe)
       description: handler.GetProduct. Returns AdminProductDetail which includes the recipe array.
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       responses:
         '200':
           description: Product details with recipe
@@ -1914,7 +1987,7 @@ paths:
       description: >
         handler.UpdateProduct. Body matches admin/model.go AdminUpdateProductRequest.
         All fields are optional (pointer) — fields not sent remain unchanged.
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       requestBody:
         required: true
         content:
@@ -1941,7 +2014,7 @@ paths:
       description: >
         handler.DeleteProduct. Soft delete if product already exists in historical transactions.
         Returns HTTP 200 { success:true } via response.NoContent() (NOT 204).
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       responses:
         '200':
           description: Product deleted
@@ -1959,7 +2032,7 @@ paths:
       description: >
         handler.UpdateProductRecipe. Replaces the entire recipe array (not a merge).
         Returns HTTP 200 { success:true } via response.NoContent() (NOT 204).
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       parameters:
         - { name: product_id, in: path, required: true, schema: { type: string, format: uuid } }
       requestBody:
@@ -1994,7 +2067,7 @@ paths:
         handler.DeleteOperator. Admin can only REMOVE operator on request.
         No request body — handler does not read body (admin/handler.go).
         Returns HTTP 200 { success:true } via response.NoContent() (NOT 204).
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       parameters:
         - { name: owner_id, in: path, required: true, schema: { type: string, format: uuid } }
         - { name: operator_id, in: path, required: true, schema: { type: string, format: uuid } }
@@ -2018,7 +2091,7 @@ paths:
         handler.ListTransactions. Filter yang diproses: status (string), business_id (uuid),
         start_date (YYYY-MM-DD, filter created_at >= start), end_date (YYYY-MM-DD, filter created_at < end+1day),
         page (default 1), limit (default 20, max 100).
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       parameters:
         - { name: status, in: query, schema: { type: string }, description: "Filter status transaksi (string bebas, tidak divalidasi enum di handler)." }
         - { name: business_id, in: query, schema: { type: string, format: uuid }, description: Filter per business. }
@@ -2048,7 +2121,7 @@ paths:
         handler.VoidTransaction. Tidak ada request body — handler tidak membaca body.
         Returns HTTP 200 { success:true } via response.NoContent() (BUKAN 204).
         409 dikembalikan jika transaksi bukan status PENDING/CONFIRMED (tidak bisa di-void).
-      security: [{ AdminKeyAuth: [] }]
+      security: [{ BearerAuth: [] }]
       parameters:
         - { name: transaction_id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
@@ -2061,10 +2134,134 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Transaksi tidak bisa di-void (sudah VOIDED atau status tidak valid)
+          description: Transaction cannot be voided (already VOIDED or invalid status)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+
+  # ---- Admin: read-only SQL console ----
+
+  /admin/query:
+    post:
+      tags: [Admin]
+      summary: Run a single read-only SELECT query (SQL console)
+      description: >
+        core/adminquery. Guarded, not a general SQL endpoint: rejects
+        anything that isn't a single SELECT/WITH statement (write CTEs,
+        SELECT ... INTO, FOR UPDATE/SHARE, dangerous function calls like
+        pg_terminate_backend, and multi-statement input via ';' are all
+        rejected before reaching the database). Executes inside a Postgres
+        READ ONLY transaction as a second, DB-enforced layer beyond the
+        text guard, with SET LOCAL statement_timeout=5s and the query
+        outer-wrapped in "SELECT * FROM (...) LIMIT 1000" so returned rows
+        are bounded regardless of what the inner query requested. Every
+        submitted query is audit-logged (action: admin.query, query text +
+        outcome in metadata) — including ones the guard blocked, since a
+        blocked destructive attempt is itself worth having on record.
+        Errors (guard rejection or a real Postgres error — syntax, unknown
+        column, timeout) are returned verbatim in `error`: this is a
+        debugging tool for a trusted, whitelisted admin, not a public
+        surface, so hiding SQL errors would make it useless.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string, description: Single SELECT or WITH...SELECT statement. }
+      responses:
+        '200':
+          description: Query executed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/AdminQueryResult' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: Query rejected by guard (not a single SELECT, multi-statement, forbidden keyword) or a real Postgres error (syntax, unknown column, timeout).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ---- Telemetry: distribution (Phase 2) ----
+
+  /telemetry/heartbeat:
+    post:
+      tags: [Telemetry]
+      summary: Report one PWA install/version heartbeat
+      description: >
+        core/telemetry. Called by klay-app (owner + operator apps; entry has
+        no authenticated session so it never calls this) once per session
+        boot plus occasionally while active. Upserts app_installs keyed on
+        (business_id, app, device_id) — business_id comes from the
+        authenticated JWT claim, NOT from the request body, so a client
+        can't report installs against a merchant it doesn't belong to.
+        device_id is a client-generated pseudonymous fingerprint
+        (crypto.randomUUID(), persisted in localStorage) — never a real
+        device or personal identifier. No transaction/order data travels
+        this path. Best-effort on the client: failures are swallowed there,
+        never surfaced to the user.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HeartbeatRequest' }
+      responses:
+        '200':
+          description: Heartbeat recorded (insert or upsert)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimpleSuccess' }
+        '400':
+          description: Invalid body (app is not one of entry/owner/operator, empty app_version/device_id)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/distribution:
+    get:
+      tags: [Admin]
+      summary: Aggregated PWA distribution stats for the admin panel
+      description: >
+        core/telemetry. Powers klay-admin's Distribution page. JWT
+        RequireAdmin only — same pattern as /admin/query, no X-Admin-Key
+        required. Returns total installs, breakdown by app, breakdown by
+        app version, breakdown by merchant, and a list of devices that
+        haven't reported in `stale_after_days` days (churn/uninstall
+        signal, capped at 100 rows).
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: app, in: query, schema: { type: string, enum: [entry, owner, operator] }, description: Filter by app. }
+        - { name: business_id, in: query, schema: { type: string, format: uuid }, description: Filter by merchant. }
+      responses:
+        '200':
+          description: Aggregated distribution stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/DistributionSummary' }
+                  error: { type: string, nullable: true }
+        '400':
+          description: business_id query param is not a valid uuid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
 # ============================================================
 # COMPONENTS
@@ -2081,11 +2278,6 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-    AdminKeyAuth:
-      type: apiKey
-      in: header
-      name: X-Admin-Key
-      description: Shared secret untuk service-to-service auth dari klay-admin panel
 
   schemas:
 
@@ -2117,12 +2309,14 @@ components:
 
     AdminUser:
       type: object
+      description: >
+        core/adminauth AdminInfo. No id: admin has no DB identity row —
+        whitelist is ADMIN_WHITELIST_EMAILS (env var), and email is both the
+        JWT subject and the client-facing identifier. email/full_name come
+        straight from the verified Google profile at login time.
       properties:
-        id: { type: string, format: uuid }
-        name: { type: string }
         email: { type: string, format: email }
-        role: { type: string, enum: [admin, super_admin] }
-        created_at: { type: string, format: date-time }
+        full_name: { type: string }
 
     # ---- Business ----
 
@@ -2477,6 +2671,91 @@ components:
         page: { type: integer }
         limit: { type: integer }
 
+    # ---- Admin: SQL console ----
+
+    AdminQueryResult:
+      type: object
+      description: >
+        Response POST /admin/query. Matches core/adminquery QueryResult.
+        Generic on purpose — columns/rows shape depends entirely on
+        whatever SELECT was submitted, so the frontend renders it as a
+        plain dynamic table.
+      properties:
+        columns:
+          type: array
+          items: { type: string }
+        rows:
+          type: array
+          items:
+            type: array
+            items: {}
+            description: One row, values in the same order as `columns`. Values are strings, numbers, booleans, or null — never base64/binary.
+        row_count: { type: integer }
+
+    # ---- Telemetry: distribution (Phase 2) ----
+
+    HeartbeatRequest:
+      type: object
+      description: Body POST /telemetry/heartbeat. Matches core/telemetry HeartbeatRequest. business_id comes from the JWT, not this body.
+      required: [app, app_version, device_id]
+      properties:
+        app: { type: string, enum: [entry, owner, operator] }
+        app_version: { type: string, maxLength: 50, description: "Build version, e.g. from package.json via a Vite define()." }
+        device_id: { type: string, maxLength: 100, description: "Client-generated pseudonymous fingerprint (crypto.randomUUID()), persisted in localStorage." }
+
+    AppTotal:
+      type: object
+      properties:
+        app: { type: string }
+        count: { type: integer }
+
+    VersionBreakdown:
+      type: object
+      properties:
+        app: { type: string }
+        app_version: { type: string }
+        count: { type: integer }
+
+    MerchantBreakdown:
+      type: object
+      properties:
+        business_id: { type: string, format: uuid }
+        business_name: { type: string }
+        entry: { type: integer }
+        owner: { type: integer }
+        operator: { type: integer }
+        total: { type: integer }
+
+    StaleDevice:
+      type: object
+      description: A device that hasn't sent a heartbeat in `stale_after_days` days — churn/uninstall signal.
+      properties:
+        business_id: { type: string, format: uuid }
+        business_name: { type: string }
+        app: { type: string }
+        app_version: { type: string }
+        last_seen_at: { type: string, format: date-time }
+
+    DistributionSummary:
+      type: object
+      description: Response GET /admin/distribution. Matches core/telemetry DistributionSummary.
+      properties:
+        total_installs: { type: integer }
+        by_app:
+          type: array
+          items: { $ref: '#/components/schemas/AppTotal' }
+        by_version:
+          type: array
+          items: { $ref: '#/components/schemas/VersionBreakdown' }
+        by_merchant:
+          type: array
+          items: { $ref: '#/components/schemas/MerchantBreakdown' }
+        stale_devices:
+          type: array
+          items: { $ref: '#/components/schemas/StaleDevice' }
+          description: Capped at 100 rows.
+        stale_after_days: { type: integer }
+
     # ---- Transaction ----
 
     TransactionStatus:
@@ -2725,6 +3004,29 @@ components:
         success: { type: boolean, example: false }
         data: { type: string, nullable: true, example: null }
         error: { type: string }
+
+    # ---- System ----
+
+    HealthStatus:
+      type: object
+      description: GET /health response — not wrapped in the {success,data,error} envelope, this is the raw body.
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        timestamp: { type: string, format: date-time }
+        uptime_seconds: { type: integer, description: Process uptime, not server/container uptime. }
+        checks:
+          type: object
+          properties:
+            database:
+              type: object
+              properties:
+                status: { type: string, enum: [up, down] }
+                latency_ms: { type: integer }
+            redis:
+              type: object
+              description: Always not_configured — Redis isn't wired into the app yet (docs/redis-caching-plan.md).
+              properties:
+                status: { type: string, enum: [not_configured] }
 
     SimpleSuccess:
       type: object
