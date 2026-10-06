@@ -33,7 +33,9 @@ function main() {
   const operations = flattenOperations(spec);
   const html = renderPage({ info: spec.info, operations });
   mkdirSync(join(ROOT, 'dist'), { recursive: true });
-  writeFileSync(join(ROOT, 'dist', 'index.html'), html);
+  // Swagger UI is the main view (/). The custom reference page moves to /reference.html.
+  copyFileSync(join(ROOT, 'swagger.html'), join(ROOT, 'dist', 'index.html'));
+  writeFileSync(join(ROOT, 'dist', 'reference.html'), html);
   copyFileSync(join(ROOT, 'src', 'styles.css'), join(ROOT, 'dist', 'styles.css'));
   copyFileSync(join(ROOT, 'favicon.png'), join(ROOT, 'dist', 'favicon.png'));
   // Swagger UI page + raw specs (Go legacy + Lite) for Try-it-out.

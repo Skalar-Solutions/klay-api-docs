@@ -2,11 +2,14 @@
 
 Static reference documentation for the Klay API (v0.6.0), generated from `openapi.yaml`.
 
+Swagger UI is the main view (`/`); the custom static reference lives at
+`/reference.html`.
+
 ## Development
 
 ```bash
 npm install
-npm run build   # outputs dist/index.html + dist/styles.css
+npm run build   # outputs dist/index.html (swagger) + dist/reference.html + specs
 open dist/index.html
 ```
 
