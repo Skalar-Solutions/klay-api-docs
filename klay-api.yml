@@ -1299,7 +1299,7 @@ paths:
       parameters:
         - name: period
           in: query
-          schema: { type: string, enum: [today, this_week, this_month, last_month], default: this_month }
+          schema: { type: string, enum: [today, this_week, this_month, last_month, all], default: this_month }
       responses:
         '200':
           description: Summary
@@ -1346,7 +1346,7 @@ paths:
       parameters:
         - name: period
           in: query
-          schema: { type: string, enum: [today, this_week, this_month, last_month], default: this_month }
+          schema: { type: string, enum: [today, this_week, this_month, last_month, all], default: this_month }
         - { name: limit, in: query, schema: { type: integer, default: 10, maximum: 50 } }
       responses:
         '200':
@@ -1372,7 +1372,7 @@ paths:
       parameters:
         - name: period
           in: query
-          schema: { type: string, enum: [this_week, this_month, last_month], default: this_month }
+          schema: { type: string, enum: [today, this_week, this_month, last_month, all], default: this_month }
       responses:
         '200':
           description: Peak hours

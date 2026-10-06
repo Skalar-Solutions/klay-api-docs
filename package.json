@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
+    "deploy:pages": "npm run build && wrangler pages deploy dist --project-name klay-api-docs",
     "test": "node --test"
   },
   "dependencies": {
