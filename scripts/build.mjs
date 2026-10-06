@@ -36,6 +36,10 @@ function main() {
   writeFileSync(join(ROOT, 'dist', 'index.html'), html);
   copyFileSync(join(ROOT, 'src', 'styles.css'), join(ROOT, 'dist', 'styles.css'));
   copyFileSync(join(ROOT, 'favicon.png'), join(ROOT, 'dist', 'favicon.png'));
+  // Swagger UI page + raw specs (Go legacy + Lite) for Try-it-out.
+  copyFileSync(join(ROOT, 'swagger.html'), join(ROOT, 'dist', 'swagger.html'));
+  copyFileSync(join(ROOT, 'klay-api.yml'), join(ROOT, 'dist', 'klay-api.yml'));
+  copyFileSync(join(ROOT, 'klay-api-lite.yml'), join(ROOT, 'dist', 'klay-api-lite.yml'));
   console.log(`Built dist/index.html — ${operations.length} operations`);
 }
 

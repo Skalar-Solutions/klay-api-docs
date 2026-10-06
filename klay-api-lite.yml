@@ -1,0 +1,2778 @@
+openapi: 3.0.3
+
+# ============================================================
+# KLAY LITE API CONTRACT v0.1.0
+# Source of truth: klay-server-lite/src (Hono + Workers + Drizzle).
+# Extracted endpoint-by-endpoint from *.router.ts + *.service.ts.
+# Where the frontend and backend disagree, the BACKEND is authoritative.
+#
+# Conventions (different from the Go contract v0.8 on purpose):
+# - Success envelope: { data: <payload> } — lib/http.ts ok().
+#   Exceptions: GET /health, GET /readyz, GET /me (raw JSON),
+#   POST .../void + DELETEs (204 empty), POST /performance/reports/export (text/csv).
+# - Error envelope: { error: { code, message, details? } } — lib/http.ts fail().
+# - Auth: Clerk JWT Bearer only. No passwords, no cookies, no static keys.
+#   org:owner = back office, org:operator = front office (auth.ts normalizeRole).
+# - Roles below are per-endpoint requireRole() gates. requireActiveBusiness
+#   (SUSPENDED / soft-deleted / deactivated-operator blocks) applies everywhere
+#   EXCEPT: POST /business, GET/PATCH /business/profile, GET /me, /health,
+#   /readyz, POST /webhooks/clerk. Telemetry needs org only (any role).
+# - Free plan caps (entitlements.ts): maxOperators 3, maxProducts 5,
+#   weeklyTransactions 50, aiInsightsPerWeek 50. Pro = unlimited (-1).
+# ============================================================
+
+info:
+  title: Klay Lite API
+  description: >
+    API contract for klay-server-lite (Cloudflare Workers + Hono + Clerk +
+    Neon Postgres). Covers business onboarding, product catalogue, operator
+    management, POS transactions (DRAFT -> PENDING -> CONFIRMED, VOIDED branch),
+    sessions/uptime, performance analytics, AI superpowers (DeepSeek insight +
+    chat, Pro only), telemetry heartbeat, platform admin, and Clerk webhooks.
+  version: 0.1.0
+  contact:
+    name: Klay Development Team
+
+servers:
+  - url: http://localhost:8787
+    description: Local development (pnpm dev:node / wrangler dev)
+  - url: https://klay-server-lite.workers.dev
+    description: Staging (Workers)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: System
+    description: Health checks and session claims.
+  - name: Business
+    description: Onboarding and business profile (Clerk org = business).
+  - name: Products
+    description: Owner-managed product catalogue with recipes.
+  - name: Operators
+    description: Cashier invitation and management (back office only).
+  - name: Transactions
+    description: POS state machine DRAFT -> PENDING -> CONFIRMED, VOIDED branch.
+  - name: Sessions
+    description: Operator uptime analytics.
+  - name: Performance
+    description: Revenue and operations analytics (back office; some Pro only).
+  - name: Analytics
+    description: AI insight cards (DeepSeek, weekly quota).
+  - name: Chat
+    description: AI chatbot (Pro only, 15-min idle retention).
+  - name: Telemetry
+    description: App install heartbeat ingest (any role).
+  - name: Admin
+    description: Skalar platform admin (separate admin Clerk org).
+  - name: Webhooks
+    description: Clerk webhook receiver (Svix verified).
+
+paths:
+
+  # ==========================================================
+  # SYSTEM
+  # ==========================================================
+
+  /:
+    get:
+      tags: [System]
+      summary: Root ping
+      security: []
+      responses:
+        '200':
+          description: Plain text greeting.
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: Hello Hono!
+
+  /health:
+    get:
+      tags: [System]
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: Service is up. Raw JSON, no {data} envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /readyz:
+    get:
+      tags: [System]
+      summary: Readiness probe (DB reachable)
+      security: []
+      responses:
+        '200':
+          description: Database reachable. Raw JSON, no {data} envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          description: DATABASE_URL missing or `select 1` failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /me:
+    get:
+      tags: [System]
+      summary: Caller auth claims
+      description: Returns Clerk session claims. Raw JSON, no {data} envelope.
+      responses:
+        '200':
+          description: Auth claims.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeClaims'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/ConfigError'
+
+  # ==========================================================
+  # BUSINESS
+  # ==========================================================
+
+  /business:
+    post:
+      tags: [Business]
+      summary: Create business for caller
+      description: >
+        requireAuth only (no org/guard). Creates a Clerk organization and the
+        Neon business row. 409 when the caller already has a business.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BusinessCreate'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BusinessResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Caller already has a business.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: already_has_business
+                  message: already has business
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+
+  /business/profile:
+    get:
+      tags: [Business]
+      summary: Get own business profile
+      description: requireAuth + requireOrg. No ActiveBusiness/role gate (self-heals first owner).
+      responses:
+        '200':
+          description: Business profile with plan limits and weekly usage.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BusinessResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/NoActiveOrganization'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+    patch:
+      tags: [Business]
+      summary: Update own business profile
+      description: requireAuth + requireOrg + back office. No ActiveBusiness gate. At least one updatable field.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BusinessPatch'
+      responses:
+        '200':
+          description: Updated profile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BusinessResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+
+  # ==========================================================
+  # PRODUCTS
+  # ==========================================================
+
+  /business/products:
+    get:
+      tags: [Products]
+      summary: List active products
+      responses:
+        '200':
+          description: Active (non-deleted) products, name ascending.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Product'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/BusinessBlocked'
+    post:
+      tags: [Products]
+      summary: Create product
+      description: Back office only. Free plan limited to 5 active products. is_available is rejected on create.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductCreate'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/PlanLimit'
+        '404':
+          description: No business row for this organization.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: business_not_found
+                  message: no business for this organization
+
+  /business/products/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [Products]
+      summary: Get product detail
+      responses:
+        '200':
+          description: Product row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/BusinessBlocked'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Products]
+      summary: Update product
+      description: Back office only. All fields optional.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductPatch'
+      responses:
+        '200':
+          description: Updated row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Products]
+      summary: Soft-delete product
+      description: Back office only. Sets deleted_at; row is kept.
+      responses:
+        '204':
+          description: Deleted. Empty body.
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ==========================================================
+  # OPERATORS
+  # ==========================================================
+
+  /business/operators:
+    get:
+      tags: [Operators]
+      summary: List members and invitations
+      description: Back office only (whole router). Includes front-office slot usage.
+      responses:
+        '200':
+          description: Members, pending invitations, and slot usage.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperatorListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/UpstreamError'
+    post:
+      tags: [Operators]
+      summary: Invite operator
+      description: Back office only. Free plan limited to 3 front-office slots.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OperatorInvite'
+      responses:
+        '201':
+          description: Invitation created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/OperatorInvitation'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Front-office quota full.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: operator_quota
+                  message: operator quota full
+        '500':
+          $ref: '#/components/responses/UpstreamError'
+
+  /business/operators/invitations/{invitationId}:
+    parameters:
+      - name: invitationId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      tags: [Operators]
+      summary: Revoke invitation
+      description: Back office only.
+      responses:
+        '200':
+          description: Revoked invitation.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/OperatorInvitation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/UpstreamError'
+
+  /business/operators/{userId}:
+    parameters:
+      - name: userId
+        in: path
+        required: true
+        schema:
+          type: string
+    patch:
+      tags: [Operators]
+      summary: Update member (role, name, active)
+      description: Back office only. At least one field. First owner is locked.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OperatorUpdate'
+      responses:
+        '200':
+          description: Updated member.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/OperatorMember'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/UpstreamError'
+    delete:
+      tags: [Operators]
+      summary: Remove member
+      description: Back office only. First owner is locked.
+      responses:
+        '204':
+          description: Removed. Empty body.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/UpstreamError'
+
+  # ==========================================================
+  # TRANSACTIONS
+  # ==========================================================
+
+  /transactions:
+    get:
+      tags: [Transactions]
+      summary: List transactions (owner view)
+      description: 'Back office only. Range YYYY-MM-DD, Asia/Jakarta, end exclusive.'
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [DRAFT, PENDING, CONFIRMED, VOIDED]
+        - name: payment_method
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/PaymentMethod'
+        - name: start_date
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/DateString'
+        - name: end_date
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/DateString'
+        - name: operator_id
+          in: query
+          required: false
+          schema:
+            type: string
+            description: Clerk user id of the operator.
+      responses:
+        '200':
+          description: Paginated transaction list with item counts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionListResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/BusinessBlocked'
+    post:
+      tags: [Transactions]
+      summary: Create DRAFT transaction
+      description: Any active member. Item prices are snapshotted from the catalogue; unknown/unavailable products are rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransactionCreate'
+      responses:
+        '201':
+          description: DRAFT transaction with items.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionDetailResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/BusinessBlocked'
+
+  /transactions/mine:
+    get:
+      tags: [Transactions]
+      summary: List own transactions (operator view)
+      description: Any active member; operator_id is forced to the caller. status=UNCONFIRMED expands to DRAFT+PENDING.
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            description: DRAFT, PENDING, CONFIRMED, VOIDED, or UNCONFIRMED (= DRAFT+PENDING).
+        - name: start_date
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/DateString'
+        - name: end_date
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/DateString'
+      responses:
+        '200':
+          description: Paginated transaction list with item counts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionListResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/BusinessBlocked'
+
+  /transactions/{transactionId}:
+    parameters:
+      - name: transactionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [Transactions]
+      summary: Get transaction detail
+      responses:
+        '200':
+          description: Transaction with items.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionDetailResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/BusinessBlocked'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /transactions/{transactionId}/items:
+    parameters:
+      - name: transactionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    patch:
+      tags: [Transactions]
+      summary: Replace DRAFT items
+      description: Deletes all items and re-inserts; total is recomputed. DRAFT only. note is ignored here.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransactionCreate'
+      responses:
+        '200':
+          description: Updated detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionDetailResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/BusinessBlocked'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/NotDraft'
+
+  /transactions/{transactionId}/checkout/begin:
+    parameters:
+      - name: transactionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [Transactions]
+      summary: Begin checkout (DRAFT -> PENDING)
+      description: Sets checkoutStartedAt; starts the 800ms slide-to-confirm window. No body.
+      responses:
+        '200':
+          description: PENDING transaction.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionDetailResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/BusinessBlocked'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/NotDraft'
+
+  /transactions/{transactionId}/checkout/confirm:
+    parameters:
+      - name: transactionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [Transactions]
+      summary: Confirm checkout (PENDING -> CONFIRMED)
+      description: >
+        Server-side gesture guard (>=800ms since begin). Free plan limited to 50
+        confirmed transactions per Jakarta week. Side effects (consumption log,
+        total_sold) run async via waitUntil.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [payment_method]
+              properties:
+                payment_method:
+                  $ref: '#/components/schemas/PaymentMethod'
+      responses:
+        '200':
+          description: CONFIRMED transaction. qris_string is set only for QRIS_STATIC.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfirmResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/PlanLimit'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Not PENDING, or slide gesture too fast.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                not-pending:
+                  value:
+                    error:
+                      code: transaction_not_pending
+                      message: transaction is not PENDING
+                too-fast:
+                  value:
+                    error:
+                      code: gesture_too_fast
+                      message: hold slide at least 800ms
+
+  /transactions/{transactionId}/void:
+    parameters:
+      - name: transactionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [Transactions]
+      summary: Void transaction
+      description: >
+        Role branches: owner may void anything not yet VOIDED (void_reason
+        required, CONFIRMED voids decrement total_sold); operator may void
+        DRAFT/PENDING only (body ignored).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                void_reason:
+                  type: string
+                  maxLength: 500
+                  description: Required for owners; ignored for operators.
+      responses:
+        '204':
+          description: Voided. Empty body.
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/BusinessBlocked'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/CannotVoid'
+
+  # ==========================================================
+  # SESSIONS
+  # ==========================================================
+
+  /sessions/uptime:
+    get:
+      tags: [Sessions]
+      summary: Store and operator uptime
+      description: Back office only. Uses the shared RangeQuery resolver (period wins over start_date/end_date; default all).
+      parameters:
+        - $ref: '#/components/parameters/PeriodParam'
+        - $ref: '#/components/parameters/StartDateParam'
+        - $ref: '#/components/parameters/EndDateParam'
+      responses:
+        '200':
+          description: Uptime breakdown.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/UptimeResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # ==========================================================
+  # PERFORMANCE
+  # ==========================================================
+
+  /performance/summary:
+    get:
+      tags: [Performance]
+      summary: Revenue summary
+      description: Back office only. Shared RangeQuery, no day cap.
+      parameters:
+        - $ref: '#/components/parameters/PeriodParam'
+        - $ref: '#/components/parameters/StartDateParam'
+        - $ref: '#/components/parameters/EndDateParam'
+      responses:
+        '200':
+          description: Totals plus payment-method breakdown.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/PerformanceSummary'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /performance/trend:
+    get:
+      tags: [Performance]
+      summary: Daily revenue trend
+      description: Back office only. Range capped to 365 days.
+      parameters:
+        - $ref: '#/components/parameters/PeriodParam'
+        - $ref: '#/components/parameters/StartDateParam'
+        - $ref: '#/components/parameters/EndDateParam'
+      responses:
+        '200':
+          description: Per-day transactions and revenue, ascending.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TrendPoint'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /performance/recap:
+    get:
+      tags: [Performance]
+      summary: Daily recap (cash/qris/voided split)
+      description: Back office only. Range capped to 365 days. Descending by date.
+      parameters:
+        - $ref: '#/components/parameters/PeriodParam'
+        - $ref: '#/components/parameters/StartDateParam'
+        - $ref: '#/components/parameters/EndDateParam'
+      responses:
+        '200':
+          description: Per-day recap rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RecapPoint'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /performance/top-products:
+    get:
+      tags: [Performance]
+      summary: Top products by revenue
+      description: Back office + Pro only (403 plan_required on free).
+      parameters:
+        - $ref: '#/components/parameters/PeriodParam'
+        - $ref: '#/components/parameters/StartDateParam'
+        - $ref: '#/components/parameters/EndDateParam'
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+      responses:
+        '200':
+          description: Top products.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TopProduct'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /performance/peak-hours:
+    get:
+      tags: [Performance]
+      summary: Transactions by hour (Asia/Jakarta)
+      description: Back office only. avg_transactions spreads the total over the calendar days in range.
+      parameters:
+        - $ref: '#/components/parameters/PeriodParam'
+        - $ref: '#/components/parameters/StartDateParam'
+        - $ref: '#/components/parameters/EndDateParam'
+      responses:
+        '200':
+          description: 24 hourly buckets (only non-empty hours returned).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PeakHour'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /performance/overview:
+    get:
+      tags: [Performance]
+      summary: Period overview with comparison
+      description: >
+        Back office only. Explicit start_date/end_date must both be YYYY-MM-DD.
+        period=all is rejected (needs a bounded range). daily_breakdown capped
+        to 365 days.
+      parameters:
+        - $ref: '#/components/parameters/PeriodParam'
+        - $ref: '#/components/parameters/StartDateParam'
+        - $ref: '#/components/parameters/EndDateParam'
+        - name: compare_with
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [previous_period, previous_year, none]
+            default: previous_period
+      responses:
+        '200':
+          description: Current period plus optional comparison with change %.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Overview'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /performance/score:
+    get:
+      tags: [Performance]
+      summary: Business health score
+      description: 'Back office only. Fixed 30-day window vs previous 30 days (weights 30/30/25/15).'
+      responses:
+        '200':
+          description: Score 0-100 with label and components.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Score'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /performance/funnel:
+    get:
+      tags: [Performance]
+      summary: Checkout funnel (draft/checkout/success)
+      description: Back office + Pro only (403 plan_required on free).
+      parameters:
+        - $ref: '#/components/parameters/PeriodParam'
+        - $ref: '#/components/parameters/StartDateParam'
+        - $ref: '#/components/parameters/EndDateParam'
+      responses:
+        '200':
+          description: Funnel stages plus voided count.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Funnel'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /performance/reports/daily-sales:
+    get:
+      tags: [Performance]
+      summary: Daily sales report
+      description: Back office only. Top products capped at 20.
+      parameters:
+        - name: date
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/DateString'
+      responses:
+        '200':
+          description: Daily report.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/DailySalesReport'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /performance/reports/monthly-sales:
+    get:
+      tags: [Performance]
+      summary: Monthly sales report
+      description: Back office only.
+      parameters:
+        - name: month
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^\d{4}-\d{2}$'
+            example: '2026-09'
+      responses:
+        '200':
+          description: Monthly report with daily rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/MonthlySalesReport'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /performance/reports/consumption:
+    get:
+      tags: [Performance]
+      summary: Ingredient consumption
+      description: Back office only. Range capped to 365 days. Quantities have 3 decimals.
+      parameters:
+        - $ref: '#/components/parameters/PeriodParam'
+        - $ref: '#/components/parameters/StartDateParam'
+        - $ref: '#/components/parameters/EndDateParam'
+      responses:
+        '200':
+          description: Per-ingredient usage.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ConsumptionItem'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /performance/reports/export:
+    post:
+      tags: [Performance]
+      summary: Export report as CSV
+      description: Back office + Pro only. Returns text/csv, not JSON.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [format, type, period]
+              properties:
+                format:
+                  type: string
+                  enum: [csv]
+                type:
+                  type: string
+                  enum: [daily_sales, monthly_sales]
+                period:
+                  type: object
+                  description: '{ date: YYYY-MM-DD } for daily_sales, { month: YYYY-MM } for monthly_sales.'
+      responses:
+        '200':
+          description: CSV payload (product_name,quantity_sold,revenue per top product; or date,transaction_count,revenue per day).
+          content:
+            text/csv:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          description: Unsupported format or report type.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                bad-format:
+                  value:
+                    error:
+                      code: unsupported_format
+                      message: unsupported format
+                bad-type:
+                  value:
+                    error:
+                      code: unsupported_type
+                      message: unsupported type
+
+  # ==========================================================
+  # ANALYTICS (AI SUPERPOWERS)
+  # ==========================================================
+
+  /superpowers/analytics/insight:
+    get:
+      tags: [Analytics]
+      summary: AI insight cards
+      description: >
+        Back office only. Cached per (business, period-label) for 6h; cache hits
+        do not consume quota. Free plan: 50 insights per Jakarta week.
+        NOTE: only `period` is read — start_date/end_date are ignored.
+      parameters:
+        - $ref: '#/components/parameters/PeriodParam'
+      x-klay-flag:
+        kind: undocumented
+        note: start_date/end_date query params are silently ignored; only period applies.
+      responses:
+        '200':
+          description: Insight cards plus mini insights.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/InsightResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/BusinessBlocked'
+        '429':
+          $ref: '#/components/responses/AiQuota'
+        '500':
+          $ref: '#/components/responses/ConfigError'
+        '504':
+          $ref: '#/components/responses/AiTimeout'
+
+  # ==========================================================
+  # CHAT (AI SUPERPOWERS, PRO ONLY)
+  # ==========================================================
+
+  /superpowers/chat/:
+    get:
+      tags: [Chat]
+      summary: Get chat history
+      description: >
+        Back office + Pro only. Without conversationId returns the caller's
+        latest conversation (up to 30 listed); none exists yet yields
+        conversationId null. NOTE: an unknown-but-well-formed conversationId
+        starts a fresh conversation instead of 404.
+      parameters:
+        - name: conversationId
+          in: query
+          required: false
+          schema:
+            type: string
+      x-klay-flag:
+        kind: suspected-bug
+        note: foreign conversationId silently opens a new conversation (ensureConversation) instead of 404.
+      responses:
+        '200':
+          description: Conversation with up to 100 oldest-to-newest messages.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ChatHistory'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Chat]
+      summary: Send chat message
+      description: >
+        Back office + Pro only. Multi-agent pipeline (identify, orchestrate,
+        tools, compose); off-topic messages are declined without tool calls.
+        Last 20 messages are used as context. Conversations idle >15 min are
+        purged by cron.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message:
+                  type: string
+                  minLength: 1
+                  maxLength: 2000
+                conversationId:
+                  type: string
+                  description: Reuses the conversation when it belongs to this business+user; otherwise a new one is created.
+      responses:
+        '200':
+          description: Assistant reply (persisted with the user message).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ChatReply'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/AiQuota'
+        '500':
+          $ref: '#/components/responses/ConfigError'
+        '502':
+          $ref: '#/components/responses/AiError'
+        '504':
+          $ref: '#/components/responses/AiTimeout'
+
+  # ==========================================================
+  # TELEMETRY
+  # ==========================================================
+
+  /platform/telemetry/heartbeat:
+    post:
+      tags: [Telemetry]
+      summary: App install heartbeat
+      description: Any active member (owner or operator). Upserts on (business, app, device). Operator session ping is best-effort.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [app, app_version, device_id]
+              properties:
+                app:
+                  type: string
+                  enum: [entry, owner, operator]
+                app_version:
+                  type: string
+                  minLength: 1
+                  maxLength: 50
+                device_id:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+      responses:
+        '200':
+          description: Acknowledged.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [received]
+                    properties:
+                      received:
+                        type: boolean
+                        example: true
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/BusinessBlocked'
+
+  # ==========================================================
+  # ADMIN (SKALAR PLATFORM)
+  # ==========================================================
+
+  /platform/admin/dashboard:
+    get:
+      tags: [Admin]
+      summary: Platform health dashboard
+      description: Separate admin Clerk org only (requireAdmin). Vendor failures degrade to ok:false / null, never 500.
+      responses:
+        '200':
+          description: Vendor snapshots plus telemetry distribution.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/AdminDashboard'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/ConfigError'
+
+  /platform/admin/distribution:
+    get:
+      tags: [Admin]
+      summary: Install distribution
+      description: Separate admin Clerk org only. Devices unseen for 14 days count as stale.
+      responses:
+        '200':
+          description: Install counts by app, version, and merchant (max 100 merchants).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Distribution'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/ConfigError'
+
+  /platform/admin/businesses:
+    get:
+      tags: [Admin]
+      summary: List businesses
+      description: Separate admin Clerk org only. Fixed limit 200, newest first.
+      responses:
+        '200':
+          description: Business rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AdminBusiness'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/ConfigError'
+
+  /platform/admin/businesses/{orgId}/plan:
+    parameters:
+      - name: orgId
+        in: path
+        required: true
+        schema:
+          type: string
+    patch:
+      tags: [Admin]
+      summary: Set business plan
+      description: Separate admin Clerk org only. Audited as business.plan.update.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan]
+              properties:
+                plan:
+                  type: string
+                  enum: [free, pro]
+      responses:
+        '200':
+          description: Updated plan.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [org_id, plan]
+                    properties:
+                      org_id:
+                        type: string
+                      plan:
+                        type: string
+                        enum: [free, pro]
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/ConfigError'
+
+  # ==========================================================
+  # WEBHOOKS
+  # ==========================================================
+
+  /webhooks/clerk:
+    post:
+      tags: [Webhooks]
+      summary: Clerk organization events
+      description: >
+        Public + Svix verified. Send the RAW body untouched. Only
+        organization.* events are processed (created = insert/upsert business,
+        updated = touch, deleted = soft-delete); other types are ignored with
+        200. Missing signing secret is 500.
+      security: []
+      parameters:
+        - name: svix-id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: svix-timestamp
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: svix-signature
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Raw Clerk webhook payload (forwarded untouched to verifyWebhook).
+      responses:
+        '200':
+          description: Received (even for ignored event types).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [received]
+                    properties:
+                      received:
+                        type: boolean
+                        example: true
+        '400':
+          description: Invalid Svix signature.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: invalid_signature
+                  message: invalid signature
+        '500':
+          $ref: '#/components/responses/ConfigError'
+
+# ============================================================
+# COMPONENTS
+# ============================================================
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Clerk session JWT. Org and role ride inside the token claims.
+
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    LimitParam:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 20
+    PeriodParam:
+      name: period
+      in: query
+      required: false
+      schema:
+        type: string
+        default: all
+        description: >
+          today | this_week | this_month | last_month | 3m | all |
+          YYYY-MM-DD | YYYY-MM-DD,YYYY-MM-DD. Wins over start_date/end_date.
+    StartDateParam:
+      name: start_date
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/DateString'
+    EndDateParam:
+      name: end_date
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/DateString'
+
+  responses:
+    ValidationError:
+      description: Input failed validation (code `validation` unless noted).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing/invalid Bearer token, or azp not in CORS_ORIGINS.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: unauthorized
+              message: unauthorized
+    Forbidden:
+      description: Role gate failed (code `forbidden`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: forbidden
+              message: forbidden
+    NoActiveOrganization:
+      description: Token carries no org_id.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: no_active_organization
+              message: no active organization
+    BusinessBlocked:
+      description: Business suspended/deleted, or operator deactivated. Includes the 401/403 auth errors above.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            suspended:
+              value:
+                error:
+                  code: business_suspended
+                  message: This business is suspended. Contact support.
+            deactivated:
+              value:
+                error:
+                  code: operator_deactivated
+                  message: This cashier account was deactivated by the business owner.
+    PlanLimit:
+      description: Free-plan quota hit (products, weekly transactions).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: plan_limit
+              message: Free plan is limited to 5 products. Upgrade to Pro for unlimited.
+    NotFound:
+      description: Row or route not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: not_found
+              message: product not found
+    NotDraft:
+      description: Transaction is not DRAFT.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: transaction_not_draft
+              message: transaction is not DRAFT
+    CannotVoid:
+      description: Void not allowed from current status.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: cannot_void
+              message: only DRAFT or PENDING can be voided by operator
+    AiQuota:
+      description: Weekly AI quota exhausted (free plan).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: ai_quota
+              message: weekly AI quota exhausted. Upgrade to Pro.
+    AiTimeout:
+      description: DeepSeek timed out.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: ai_timeout
+              message: AI request timed out
+    AiError:
+      description: DeepSeek returned a non-429/5xx error (server-logged).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: ai_error
+              message: AI request failed
+    UpstreamError:
+      description: Clerk/Neon/DeepSeek call failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ConfigError:
+      description: Server env missing (e.g. CLERK_ISSUER_URL, ADMIN_ORG_ID, DEEPSEEK_API_KEY).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: config
+              message: ADMIN_ORG_ID is not configured
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            details:
+              description: Optional machine-readable detail (e.g. allowed values).
+    DateString:
+      type: string
+      pattern: '^\d{4}-\d{2}-\d{2}$'
+      example: '2026-09-01'
+    PaymentMethod:
+      type: string
+      enum: [CASH, QRIS_STATIC, TRANSFER]
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, db_unreachable]
+    MeClaims:
+      type: object
+      required: [sub]
+      properties:
+        sub:
+          type: string
+          description: Clerk user id.
+        sessionId:
+          type: string
+        orgId:
+          type: string
+          description: Clerk organization id (= business id).
+        orgRole:
+          type: string
+          enum: [org:owner, org:operator]
+    Business:
+      type: object
+      required: [id, klay_id, merchant_status, max_operators, plan, is_paid, limits, usage, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          description: Clerk organization id.
+        klay_id:
+          type: string
+          example: KLAY-000016
+        name:
+          type: string
+          nullable: true
+        address:
+          type: string
+          nullable: true
+        city:
+          type: string
+          nullable: true
+        country:
+          type: string
+          nullable: true
+        phone:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+        category:
+          type: string
+          nullable: true
+          enum: ['F&B', Retail, Jasa, Lainnya]
+        qris_string:
+          type: string
+          nullable: true
+        merchant_status:
+          type: string
+          enum: [PENDING, REGISTERED, ACTIVE, SUSPENDED]
+        max_operators:
+          type: integer
+        first_owner_user_id:
+          type: string
+          nullable: true
+        plan:
+          type: string
+          enum: [free, pro]
+        is_paid:
+          type: boolean
+        limits:
+          $ref: '#/components/schemas/BusinessLimits'
+        usage:
+          $ref: '#/components/schemas/BusinessUsage'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    BusinessLimits:
+      type: object
+      required: [max_operators, max_products, weekly_transactions, ai_insights]
+      properties:
+        max_operators:
+          type: integer
+        max_products:
+          type: integer
+          description: -1 = unlimited.
+        weekly_transactions:
+          type: integer
+          description: -1 = unlimited.
+        ai_insights:
+          type: integer
+          description: -1 = unlimited.
+    BusinessUsage:
+      type: object
+      required: [weekly_transactions, ai_insights]
+      properties:
+        weekly_transactions:
+          type: integer
+        ai_insights:
+          type: integer
+    BusinessCreate:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        address:
+          type: string
+          maxLength: 2000
+        city:
+          type: string
+          maxLength: 100
+        country:
+          type: string
+          maxLength: 100
+        phone:
+          type: string
+          maxLength: 32
+        description:
+          type: string
+          maxLength: 2000
+        category:
+          type: string
+          maxLength: 50
+          enum: ['F&B', Retail, Jasa, Lainnya]
+        qris_string:
+          type: string
+          maxLength: 4000
+          description: Accepted but only profile metadata is persisted on create.
+    BusinessPatch:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        address:
+          type: string
+          maxLength: 2000
+        city:
+          type: string
+          maxLength: 100
+        country:
+          type: string
+          maxLength: 100
+        phone:
+          type: string
+          maxLength: 32
+        description:
+          type: string
+          maxLength: 2000
+        category:
+          type: string
+          maxLength: 50
+          enum: ['F&B', Retail, Jasa, Lainnya]
+        qris_string:
+          type: string
+          maxLength: 4000
+          description: Persisted to Neon (unlike create).
+    BusinessResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Business'
+    RecipeItem:
+      type: object
+      required: [ingredient, quantity]
+      properties:
+        ingredient:
+          type: string
+          minLength: 1
+        quantity:
+          type: number
+          exclusiveMinimum: 0
+        unit:
+          type: string
+    Product:
+      type: object
+      required: [id, business_id, name, price, cost_price, is_available, total_sold, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        business_id:
+          type: string
+        name:
+          type: string
+        price:
+          type: integer
+          minimum: 0
+        category:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+        recipe:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/RecipeItem'
+        cost_price:
+          type: integer
+          minimum: 0
+        is_available:
+          type: boolean
+        total_sold:
+          type: integer
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ProductCreate:
+      type: object
+      required: [name, price]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        price:
+          type: integer
+          minimum: 0
+        category:
+          type: string
+          maxLength: 100
+        description:
+          type: string
+          maxLength: 2000
+        recipe:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/RecipeItem'
+        cost_price:
+          type: integer
+          minimum: 0
+          default: 0
+    ProductPatch:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        price:
+          type: integer
+          minimum: 0
+        category:
+          type: string
+          maxLength: 100
+          nullable: true
+        description:
+          type: string
+          maxLength: 2000
+          nullable: true
+        recipe:
+          nullable: true
+          description: Array replaces the whole recipe; null clears it.
+        cost_price:
+          type: integer
+          minimum: 0
+        is_available:
+          type: boolean
+    ProductResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Product'
+    OperatorMember:
+      type: object
+      properties:
+        id:
+          type: string
+        userId:
+          type: string
+        name:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+        imageUrl:
+          type: string
+          nullable: true
+        role:
+          type: string
+        createdAt:
+          type: string
+        active:
+          type: boolean
+        lastActiveAt:
+          type: string
+          nullable: true
+        shifts:
+          type: integer
+          nullable: true
+        transactions:
+          type: integer
+          nullable: true
+        revenue:
+          type: integer
+          nullable: true
+    OperatorInvitation:
+      type: object
+      properties:
+        id:
+          type: string
+        emailAddress:
+          type: string
+        role:
+          type: string
+        status:
+          type: string
+        createdAt:
+          type: string
+          nullable: true
+        expiresAt:
+          type: string
+          nullable: true
+    OperatorList:
+      type: object
+      required: [members, invitations, slot_used, slot_max]
+      properties:
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/OperatorMember'
+        invitations:
+          type: array
+          items:
+            $ref: '#/components/schemas/OperatorInvitation'
+        slot_used:
+          type: integer
+          description: Front-office member count.
+        slot_max:
+          type: integer
+          description: 3 on free, -1 (unlimited) on pro.
+    OperatorListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/OperatorList'
+    OperatorInvite:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum: [back_office, front_office]
+          default: front_office
+        redirectUrl:
+          type: string
+          format: uri
+          description: Must be an http(s) URL when present.
+    OperatorUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        role:
+          type: string
+          enum: [back_office, front_office]
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        active:
+          type: boolean
+    Transaction:
+      type: object
+      required: [id, business_id, transaction_id, total_amount, status, item_count, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        business_id:
+          type: string
+        operator_id:
+          type: string
+          nullable: true
+        operator_name:
+          type: string
+          nullable: true
+        transaction_id:
+          type: string
+          description: Human short id <short>-<unix>-<4hex>.
+        total_amount:
+          type: integer
+        payment_method:
+          $ref: '#/components/schemas/PaymentMethod'
+        status:
+          type: string
+          enum: [DRAFT, PENDING, CONFIRMED, VOIDED]
+        item_count:
+          type: integer
+        note:
+          type: string
+          nullable: true
+        confirmed_at:
+          type: string
+          format: date-time
+          nullable: true
+        voided_at:
+          type: string
+          format: date-time
+          nullable: true
+        void_reason:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    TransactionItem:
+      type: object
+      required: [product_name, unit_price, quantity, subtotal]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+          nullable: true
+        product_name:
+          type: string
+        unit_price:
+          type: integer
+        quantity:
+          type: integer
+        subtotal:
+          type: integer
+    TransactionDetail:
+      allOf:
+        - $ref: '#/components/schemas/Transaction'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/TransactionItem'
+    TransactionCreate:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [product_id, quantity]
+            properties:
+              product_id:
+                type: string
+                format: uuid
+              quantity:
+                type: integer
+                minimum: 1
+        note:
+          type: string
+          maxLength: 500
+    TransactionListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [transactions, pagination]
+          properties:
+            transactions:
+              type: array
+              items:
+                $ref: '#/components/schemas/Transaction'
+            pagination:
+              type: object
+              required: [page, limit, total_items, total_pages]
+              properties:
+                page:
+                  type: integer
+                limit:
+                  type: integer
+                total_items:
+                  type: integer
+                total_pages:
+                  type: integer
+    TransactionDetailResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/TransactionDetail'
+    ConfirmResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          allOf:
+            - $ref: '#/components/schemas/TransactionDetail'
+            - type: object
+              properties:
+                qris_string:
+                  type: string
+                  nullable: true
+                  description: Set only when payment_method is QRIS_STATIC.
+    UptimeResult:
+      type: object
+      required: [start_date, end_date, store_online_hours, total_operator_hours, operators]
+      properties:
+        start_date:
+          type: string
+          format: date-time
+        end_date:
+          type: string
+          format: date-time
+        store_online_hours:
+          type: number
+        total_operator_hours:
+          type: number
+        operators:
+          type: array
+          items:
+            type: object
+            required: [operator_id, online_hours, shifts]
+            properties:
+              operator_id:
+                type: string
+              name:
+                type: string
+                nullable: true
+              online_hours:
+                type: number
+              shifts:
+                type: integer
+              last_active_at:
+                type: string
+                format: date-time
+                nullable: true
+    PerformanceSummary:
+      type: object
+      properties:
+        total_revenue:
+          type: integer
+        total_cost:
+          type: integer
+        total_profit:
+          type: integer
+        total_transactions:
+          type: integer
+        total_pending:
+          type: integer
+        total_voided:
+          type: integer
+        avg_transaction_value:
+          type: number
+        breakdown_by_method:
+          type: array
+          items:
+            type: object
+            properties:
+              method:
+                $ref: '#/components/schemas/PaymentMethod'
+              revenue:
+                type: integer
+              count:
+                type: integer
+        period:
+          type: string
+    TrendPoint:
+      type: object
+      required: [date, total_transactions, total_revenue]
+      properties:
+        date:
+          $ref: '#/components/schemas/DateString'
+        total_transactions:
+          type: integer
+        total_revenue:
+          type: integer
+    RecapPoint:
+      type: object
+      properties:
+        date:
+          $ref: '#/components/schemas/DateString'
+        transactions:
+          type: integer
+        revenue:
+          type: integer
+        cash:
+          type: integer
+        qris:
+          type: integer
+        voided:
+          type: integer
+    TopProduct:
+      type: object
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        product_name:
+          type: string
+        category:
+          type: string
+          nullable: true
+        total_sold:
+          type: integer
+        total_revenue:
+          type: integer
+    PeakHour:
+      type: object
+      required: [hour, total_transactions, revenue, avg_transactions]
+      properties:
+        hour:
+          type: integer
+          minimum: 0
+          maximum: 23
+          description: Asia/Jakarta hour.
+        total_transactions:
+          type: integer
+        revenue:
+          type: integer
+        avg_transactions:
+          type: number
+    Overview:
+      type: object
+      required: [current_period]
+      properties:
+        current_period:
+          type: object
+          properties:
+            total_revenue:
+              type: integer
+            total_cost:
+              type: integer
+            total_profit:
+              type: integer
+            total_transactions:
+              type: integer
+            total_confirmed:
+              type: integer
+            total_voided:
+              type: integer
+            start_date:
+              type: string
+            end_date:
+              type: string
+            daily_breakdown:
+              type: array
+              items:
+                $ref: '#/components/schemas/TrendPoint'
+        comparison:
+          type: object
+          description: Absent when compare_with=none.
+          properties:
+            previous_period:
+              type: object
+            revenue_change_pct:
+              type: number
+              nullable: true
+            transactions_change_pct:
+              type: number
+              nullable: true
+    Score:
+      type: object
+      required: [score, label, components, window_days]
+      properties:
+        score:
+          type: integer
+          minimum: 0
+          maximum: 100
+        label:
+          type: string
+          enum: [Bad, Cukup, Bagus, Mantap]
+        components:
+          type: object
+          properties:
+            growth:
+              type: number
+              nullable: true
+            margin:
+              type: number
+            consistency:
+              type: number
+            void:
+              type: number
+        window_days:
+          type: integer
+          example: 30
+    Funnel:
+      type: object
+      required: [period, stages, voided]
+      properties:
+        period:
+          type: string
+        stages:
+          type: array
+          items:
+            type: object
+            required: [key, label, value]
+            properties:
+              key:
+                type: string
+                enum: [draft, checkout, success]
+              label:
+                type: string
+              value:
+                type: integer
+        voided:
+          type: integer
+    DailySalesReport:
+      type: object
+      properties:
+        date:
+          $ref: '#/components/schemas/DateString'
+        revenue:
+          type: integer
+        cost:
+          type: integer
+        profit:
+          type: integer
+        transactions:
+          type: integer
+        by_method:
+          type: array
+          items:
+            type: object
+            properties:
+              method:
+                $ref: '#/components/schemas/PaymentMethod'
+              revenue:
+                type: integer
+              count:
+                type: integer
+        top_products:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              quantity:
+                type: integer
+              revenue:
+                type: integer
+    MonthlySalesReport:
+      type: object
+      properties:
+        month:
+          type: string
+          example: '2026-09'
+        revenue:
+          type: integer
+        cost:
+          type: integer
+        profit:
+          type: integer
+        transactions:
+          type: integer
+        daily:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                $ref: '#/components/schemas/DateString'
+              total_transactions:
+                type: integer
+              total_revenue:
+                type: integer
+        by_method:
+          type: array
+          items:
+            type: object
+            properties:
+              method:
+                $ref: '#/components/schemas/PaymentMethod'
+              revenue:
+                type: integer
+              count:
+                type: integer
+    ConsumptionItem:
+      type: object
+      required: [ingredient, quantity_used, transactions]
+      properties:
+        ingredient:
+          type: string
+        quantity_used:
+          type: number
+        unit:
+          type: string
+          nullable: true
+        transactions:
+          type: integer
+    InsightCard:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [trend, warning, opportunity]
+        title:
+          type: string
+        narrative:
+          type: string
+        confidence_score:
+          type: number
+          nullable: true
+        model_version:
+          type: string
+        updated_at:
+          type: string
+    InsightResult:
+      type: object
+      properties:
+        cards:
+          type: array
+          items:
+            $ref: '#/components/schemas/InsightCard'
+        mini_insights:
+          type: object
+          properties:
+            trend:
+              type: string
+              nullable: true
+            top_products:
+              type: string
+              nullable: true
+            payment_methods:
+              type: string
+              nullable: true
+            peak_hours:
+              type: string
+              nullable: true
+            profit_projection:
+              type: string
+              nullable: true
+        model_version:
+          type: string
+          example: deepseek-chat
+        updated_at:
+          type: string
+        source_data_window:
+          type: object
+          properties:
+            start_date:
+              type: string
+            end_date:
+              type: string
+    ChatMessage:
+      type: object
+      required: [id, role, content, createdAt]
+      properties:
+        id:
+          type: string
+        role:
+          type: string
+          enum: [user, assistant]
+        content:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        meta:
+          type: object
+          nullable: true
+    ChatReply:
+      type: object
+      required: [conversationId, message]
+      properties:
+        conversationId:
+          type: string
+        message:
+          type: string
+        insight:
+          type: string
+          nullable: true
+        model:
+          type: string
+          example: deepseek-chat
+    ChatHistory:
+      type: object
+      properties:
+        conversationId:
+          type: string
+          nullable: true
+        stage:
+          type: string
+          nullable: true
+        model:
+          type: string
+          example: deepseek-chat
+        messages:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+    AdminDashboard:
+      type: object
+      properties:
+        vendors:
+          type: object
+          properties:
+            neon:
+              type: object
+            clerk:
+              type: object
+            deepseek:
+              type: object
+            sentry:
+              type: object
+        neon:
+          type: object
+          description: Row counts snapshot (businesses, merchants_active, products, orders...).
+        clerk:
+          type: object
+        telemetry:
+          $ref: '#/components/schemas/Distribution'
+          nullable: true
+        as_of:
+          type: string
+          format: date-time
+    Distribution:
+      type: object
+      properties:
+        total_installs:
+          type: integer
+        by_app:
+          type: array
+          items:
+            type: object
+        by_version:
+          type: array
+          items:
+            type: object
+        by_merchant:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+        stale_devices:
+          type: integer
+        stale_after_days:
+          type: integer
+          example: 14
+    AdminBusiness:
+      type: object
+      properties:
+        org_id:
+          type: string
+        klay_id:
+          type: string
+        plan:
+          type: string
+          enum: [free, pro]
+        merchant_status:
+          type: string
+        max_operators:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
